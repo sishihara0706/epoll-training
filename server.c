@@ -8,6 +8,7 @@
 #include<netinet/in.h>
 #include<sys/epoll.h>
 #include<errno.h>
+#include<signal.h>
 
 #define PORT 8080
 #define EVENT_NUM 1000
@@ -48,6 +49,11 @@ static int flush_output(struct st_client *client)
 		if (nw == -1 && errno == EINTR)
 		{
 			continue;
+		}
+		
+		if (nw == -1 && errno == EPIPE)
+		{
+			return 1; // client切断扱い
 		}
 
 		if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
@@ -116,9 +122,14 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 	
 	if(events & EPOLLOUT)
 	{
-		if(flush_output(client) == -1)
+		int ret = flush_output(client);
+		if(ret == -1)
 		{
 			return -1;
+		}
+		else if(ret == 1)
+		{
+			return 1; // 閉じているclientに書き込もうとした
 		}
 		else if(client->out_pos == client->out_len)
 		{
@@ -167,9 +178,14 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 				printf("receive from client fd%d, message:%s\n", client->base.fd, buff);
 
 				client->out_len = snprintf(client->outbuff, sizeof(client->outbuff), "%s\n", buff);
-				if(flush_output(client) == -1)
+				int ret = flush_output(client);
+				if(ret == -1)
 				{
 					return -1;
+				}
+				else if(ret == 1)
+				{
+					return 1;
 				}
 				else if(client->out_pos == client->out_len)
 				{
@@ -205,9 +221,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 			if(nr == 0)
 			{
 				printf("disconnetcted. client fd:%d\n", client->base.fd);
-				close(client->base.fd);
-				free(client);
-				return 0;
+				return 1;
 			}
 			if(nr == -1 && errno == EINTR)
 			{
@@ -226,6 +240,8 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 
 int main (void)
 {
+	signal(SIGPIPE, SIG_IGN); // SIGPIPEを無視する
+
 	int sfd, nfds;
 	int n;
 	struct sockaddr_in my_addr;	
@@ -281,6 +297,7 @@ int main (void)
 	struct epoll_event events[EVENT_NUM];
 	printf("listening on 8080\n");
 
+	// epoll event loop
 	for(;;)
 	{
 		nfds = epoll_wait(epoll_fd, events, EVENT_NUM, -1);
@@ -309,11 +326,22 @@ int main (void)
 			{
 				struct st_client *client = events[n].data.ptr;
 				// clientからのメッセージ受信
-				if(handle_client(epoll_fd, client, events[n].events) == -1)
+				int ret = handle_client(epoll_fd, client, events[n].events);
+				if(ret == -1)
 				{
 					close(client->base.fd);
 					free(client);
 					return -1;
+				}
+				else if (ret == 1)
+				{
+					close(client->base.fd);
+					free(client);
+					continue;
+				}
+				else
+				{
+					;
 				}
 			}
 		}
