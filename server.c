@@ -13,6 +13,7 @@
 #define PORT 8080
 #define EVENT_NUM 1000
 #define BUFF_SIZE 4096
+#define LISTEN_NUM 128
 
 enum fd_type
 {
@@ -263,7 +264,7 @@ int main (void)
 		return -1;
 	}
 
-	if(listen(sfd, 5) == -1)
+	if(listen(sfd, LISTEN_NUM) == -1)
 	{
 		perror("listen");
 		return -1;
