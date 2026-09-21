@@ -33,6 +33,33 @@ struct st_client {
 	size_t out_pos; // 何バイト目まで送信済みか
 };
 
+static int flush_output(struct st_client *client)
+{
+	ssize_t nw;
+
+	while(client->out_pos < client->out_len)
+	{
+		nw = write(client->base.fd, client->outbuff + client->out_pos, client->out_len - client->out_pos);
+		if(nw > 0)
+		{
+			client->out_pos += nw;
+			continue;
+		}
+		if (nw == -1 && errno == EINTR)
+		{
+			continue;
+		}
+
+		if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+		{ 
+			break;
+		}
+		perror("write");
+		return -1;
+	}
+	return 0;
+}
+
 static int accept_client(int epoll_fd, int sfd)
 {
 	struct sockaddr_in peer_addr;
@@ -85,31 +112,15 @@ static int accept_client(int epoll_fd, int sfd)
 static int handle_client(int epoll_fd, struct st_client *client, uint32_t events)
 {
 	char buff[BUFF_SIZE+1];	
-	ssize_t nr,nw;
+	ssize_t nr;
 	
 	if(events & EPOLLOUT)
 	{
-		while(client->out_pos < client->out_len)
+		if(flush_output(client) == -1)
 		{
-			nw = write(client->base.fd, client->outbuff + client->out_pos, client->out_len - client->out_pos);
-			if(nw > 0)
-			{
-				client->out_pos += nw;
-				continue;
-			}
-			if (nw == -1 && errno == EINTR)
-			{
-				continue;
-			}
-
-			if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-			{ 
-				break;
-			}
-			perror("write");
 			return -1;
 		}
-		if(client->out_pos == client->out_len)
+		else if(client->out_pos == client->out_len)
 		{
 			client->out_pos = 0;
 			client->out_len = 0;
@@ -136,6 +147,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 				perror("epoll_ctl"); 
 				return -1; 
 			}
+			return 0; // まだ未送信なのでEPOLLINを処理しない
 		}
 	}
 
@@ -155,28 +167,11 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 				printf("receive from client fd%d, message:%s\n", client->base.fd, buff);
 
 				client->out_len = snprintf(client->outbuff, sizeof(client->outbuff), "%s\n", buff);
-
-				while(client->out_pos < client->out_len)
+				if(flush_output(client) == -1)
 				{
-					nw = write(client->base.fd, client->outbuff + client->out_pos, client->out_len - client->out_pos);
-					if(nw > 0)
-					{
-						client->out_pos += nw;
-						continue;
-					}
-					if (nw == -1 && errno == EINTR)
-					{
-						continue;
-					}
-
-					if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-					{ 
-						break;
-					}
-					perror("write");
 					return -1;
 				}
-				if(client->out_pos == client->out_len)
+				else if(client->out_pos == client->out_len)
 				{
 					client->out_pos = 0;
 					client->out_len = 0;
@@ -190,8 +185,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 						perror("epoll_ctl"); 
 						return -1; 
 					}
-
-					continue; //全部送れたので、次のreadへ
+					continue;
 				}
 				else
 				{
@@ -205,8 +199,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 						perror("epoll_ctl"); 
 						return -1; 
 					}
-
-					return 0; // 未送信データがあるので、次のreadには行かない。	
+					return 0; // まだ未送信なのでEPOLLINを処理しない
 				}
 			}
 			if(nr == 0)
@@ -293,6 +286,8 @@ int main (void)
 		nfds = epoll_wait(epoll_fd, events, EVENT_NUM, -1);
 		if (nfds == -1)
 		{
+			if(errno == EINTR) { continue; }
+
 			perror("epoll_wait");
 			return -1;
 		}
