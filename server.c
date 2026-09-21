@@ -13,10 +13,31 @@
 #define EVENT_NUM 1000
 #define BUFF_SIZE 4096
 
+enum fd_type
+{
+	FD_LISTENER,
+	FD_CLIENT
+};
+
+struct fd_info
+{
+	enum fd_type type;
+	int fd;
+};
+
+struct st_client {
+	struct fd_info base;
+
+	char outbuff[BUFF_SIZE+2];
+	size_t out_len; // 全体で何バイト送る予定か
+	size_t out_pos; // 何バイト目まで送信済みか
+};
+
 static int accept_client(int epoll_fd, int sfd)
 {
 	struct sockaddr_in peer_addr;
 	struct epoll_event ev;
+	struct st_client *client;
 	int cfd;
 
 	for(;;)
@@ -26,12 +47,24 @@ static int accept_client(int epoll_fd, int sfd)
 
 		if(cfd >= 0)
 		{
+			client = calloc(1, sizeof(*client));
+			if(client == NULL)
+			{
+				perror("calloc");
+				close(cfd);
+				return -1;
+			}
+			client->base.type = FD_CLIENT;
+			client->base.fd = cfd;
+
 			ev.events = EPOLLIN; 
-			ev.data.fd = cfd; 
+			ev.data.ptr = client;
+ 
 			if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cfd, &ev)==-1) 
 			{ 
 				perror("epoll_ctl"); 
-				close(cfd); 
+				close(client->base.fd); 
+				free(client);
 				return -1; 
 			}
 			printf("connected. client fd:%d\n", cfd);
@@ -49,68 +82,151 @@ static int accept_client(int epoll_fd, int sfd)
 	return 0;
 }
 
-static int handle_client(int fd)
+static int handle_client(int epoll_fd, struct st_client *client, uint32_t events)
 {
 	char buff[BUFF_SIZE+1];	
-	ssize_t total = 0;
 	ssize_t nr,nw;
-	int write_len; //書き込みたい長さ
-	char send_buff[BUFF_SIZE+2];
-
-	for(;;)
+	
+	if(events & EPOLLOUT)
 	{
-		nr = read(fd, buff, BUFF_SIZE);
-
-		if(nr > 0)
+		while(client->out_pos < client->out_len)
 		{
-			total = 0;
-
-			//read は'\0'をつけないので自分でつける
-			buff[nr] = '\0';
-			buff[strcspn(buff, "\r\n")] = '\0';
-			printf("receive from client fd%d, message:%s\n", fd, buff);
-
-			write_len = snprintf(send_buff, sizeof(send_buff), "%s\n", buff);
-
-			while(total < write_len)
+			nw = write(client->base.fd, client->outbuff + client->out_pos, client->out_len - client->out_pos);
+			if(nw > 0)
 			{
-				nw = write(fd, send_buff + total, write_len - total);
-				if(nw > 0)
-				{
-					total += nw;
-					continue;
-				}
-				if (nw == -1 && errno == EINTR)
-				{
-					continue;
-				}
+				client->out_pos += nw;
+				continue;
+			}
+			if (nw == -1 && errno == EINTR)
+			{
+				continue;
+			}
 
-				if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-				{ 
-					break;
-				}
-				perror("write");
+			if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			{ 
 				break;
 			}
-			continue;
+			perror("write");
+			return -1;
 		}
-		if(nr == 0)
+		if(client->out_pos == client->out_len)
 		{
-			printf("disconnetcted. client fd:%d\n", fd);
-			close(fd);
-			break;
-		}
-		if(errno == EINTR)
-		{
-			continue;
-		}	
-		if(errno == EAGAIN || errno == EWOULDBLOCK)
-		{
-			break;
-		}
+			client->out_pos = 0;
+			client->out_len = 0;
+			struct epoll_event ev = {
+				.events = EPOLLIN,
+				.data.ptr = client
+			};
 
-		perror("read");
-		return -1;
+			if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
+			{ 
+				perror("epoll_ctl"); 
+				return -1; 
+			}
+		}
+		else
+		{
+			struct epoll_event ev = {
+				.events = EPOLLIN | EPOLLOUT,
+				.data.ptr = client
+			};
+
+			if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
+			{ 
+				perror("epoll_ctl"); 
+				return -1; 
+			}
+		}
+	}
+
+	if(events & EPOLLIN)
+	{
+		for(;;)
+		{
+			nr = read(client->base.fd, buff, BUFF_SIZE);
+
+			if(nr > 0)
+			{
+				client->out_pos = 0;
+
+				//read は'\0'をつけないので自分でつける
+				buff[nr] = '\0';
+				buff[strcspn(buff, "\r\n")] = '\0';
+				printf("receive from client fd%d, message:%s\n", client->base.fd, buff);
+
+				client->out_len = snprintf(client->outbuff, sizeof(client->outbuff), "%s\n", buff);
+
+				while(client->out_pos < client->out_len)
+				{
+					nw = write(client->base.fd, client->outbuff + client->out_pos, client->out_len - client->out_pos);
+					if(nw > 0)
+					{
+						client->out_pos += nw;
+						continue;
+					}
+					if (nw == -1 && errno == EINTR)
+					{
+						continue;
+					}
+
+					if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+					{ 
+						break;
+					}
+					perror("write");
+					return -1;
+				}
+				if(client->out_pos == client->out_len)
+				{
+					client->out_pos = 0;
+					client->out_len = 0;
+					struct epoll_event ev = {
+						.events = EPOLLIN,
+						.data.ptr = client
+					};
+
+					if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
+					{ 
+						perror("epoll_ctl"); 
+						return -1; 
+					}
+
+					continue; //全部送れたので、次のreadへ
+				}
+				else
+				{
+					struct epoll_event ev = {
+						.events = EPOLLIN | EPOLLOUT,
+						.data.ptr = client
+					};
+
+					if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
+					{ 
+						perror("epoll_ctl"); 
+						return -1; 
+					}
+
+					return 0; // 未送信データがあるので、次のreadには行かない。	
+				}
+			}
+			if(nr == 0)
+			{
+				printf("disconnetcted. client fd:%d\n", client->base.fd);
+				close(client->base.fd);
+				free(client);
+				return 0;
+			}
+			if(nr == -1 && errno == EINTR)
+			{
+				continue;
+			}	
+			if(nr == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			{
+				break;
+			}
+			perror("read");
+			return -1;
+		}
 	}
 	return 0;
 }
@@ -130,7 +246,7 @@ int main (void)
 	memset(&my_addr, 0, sizeof(my_addr));
 	my_addr.sin_family = AF_INET;
 	my_addr.sin_port = htons(PORT);
-	my_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // ローカルホストを指定
+	my_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
 	if(bind(sfd, (struct sockaddr *)&my_addr, sizeof(my_addr) )==-1)
 	{
@@ -153,9 +269,15 @@ int main (void)
 
 	}
 
+	// listener用のfd_infoを作成
+	struct fd_info listener = {
+		.type = FD_LISTENER,
+		.fd = sfd
+	};
+
 	struct epoll_event ev;
 	ev.events = EPOLLIN;
-	ev.data.fd = sfd;
+	ev.data.ptr = &listener;
 
 	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, sfd, &ev) == -1)
 	{
@@ -177,21 +299,25 @@ int main (void)
 
 		for (n = 0; n < nfds; n++)
 		{
-			int fd = events[n].data.fd;
-			if (fd == sfd)
+			// int fd = events[n].data.fd;
+			struct fd_info *info = events[n].data.ptr;
+
+			if (info->type == FD_LISTENER)
 			{
 				// 新規接続
-				if(accept_client(epoll_fd, sfd) == -1)
+				if(accept_client(epoll_fd, info->fd) == -1)
 				{
 					return -1;
 				}
 			}
 			else
 			{
+				struct st_client *client = events[n].data.ptr;
 				// clientからのメッセージ受信
-				if(handle_client(fd) == -1)
+				if(handle_client(epoll_fd, client, events[n].events) == -1)
 				{
-					close(fd);
+					close(client->base.fd);
+					free(client);
 					return -1;
 				}
 			}
