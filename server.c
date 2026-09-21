@@ -59,6 +59,12 @@ static int flush_output(struct st_client *client)
 
 		if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
 		{ 
+			printf(
+					"write EAGAIN fd=%d pos=%zu len=%zu\n",
+					client->base.fd,
+					client->out_pos,
+					client->out_len
+				  );
 			break;
 		}
 		perror("write");
@@ -123,6 +129,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 	
 	if(events & EPOLLOUT)
 	{
+		printf("EPOLLOUT fd=%d\n", client->base.fd);
 		int ret = flush_output(client);
 		if(ret == -1)
 		{
