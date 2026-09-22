@@ -52,7 +52,7 @@ static int flush_output(struct st_client *client)
 			continue;
 		}
 		
-		if (nw == -1 && errno == EPIPE)
+		if (nw == -1 && errno == EPIPE)//閉じているソケットに書き込もうとした
 		{
 			return 1; // client切断扱い
 		}
