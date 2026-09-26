@@ -22,6 +22,7 @@ Topics explored include:
 * `Recv-Q` / `Send-Q`
 * backpressure
 * client state management
+* periodic processing with `timerfd`
 * file descriptor reuse
 * `SIGPIPE` / `EPIPE`
 * observing system calls with `strace`
@@ -33,6 +34,7 @@ Topics explored include:
 * `epoll`-based I/O multiplexing
 * non-blocking sockets
 * multiple concurrent clients
+* periodic reporting of active client connections with `timerfd`
 * `accept4()` with:
 
   * `SOCK_NONBLOCK`
@@ -92,12 +94,18 @@ epoll_wait()
    |             enable EPOLLOUT
    |
    +-- EPOLLOUT on client
+   |       |
+   |     resume pending write
+   |       |
+   |       +-- all data written
+   |               |
+   |             disable EPOLLOUT
+   |
+   +-- EPOLLIN on timerfd (every 10 seconds)
            |
-         resume pending write
+         read timer expiration count
            |
-           +-- all data written
-                   |
-                 disable EPOLLOUT
+         report active client connections
 ```
 
 ## Per-client State
@@ -186,6 +194,25 @@ The server listens on TCP port `8080`.
 ```text
 listening on 8080
 ```
+
+## Periodic Connection Monitoring
+
+The server creates a non-blocking `timerfd` and registers it with the same
+`epoll` instance as the listener and client sockets. The timer expires every
+10 seconds, allowing periodic work to remain inside the event loop without a
+separate thread or signal handler.
+
+On each timer event, the server reports the current number of active client
+connections and the number of timer expirations consumed by `read()`:
+
+```text
+active clients: 3
+timer fired: 1 time(s)
+```
+
+The expiration count is normally `1`. It can be greater when the event loop
+could not process the timer immediately, because `timerfd` accumulates
+expirations until they are read.
 
 ## Manual Test
 
@@ -569,4 +596,3 @@ close
 This repository is primarily a learning project for Linux systems programming, TCP networking, and event-driven server design.
 
 The emphasis is not only on making the echo server work, but also on understanding and observing what happens inside Linux when multiple TCP clients are handled concurrently.
-

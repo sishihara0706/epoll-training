@@ -24,6 +24,7 @@ C言語でTCP Echo Serverを実装し、単一の `epoll` イベントループ�
 * `Recv-Q` / `Send-Q`
 * TCPバックプレッシャー
 * クライアントごとの状態管理
+* `timerfd` を利用した定期処理
 * file descriptorの再利用
 * `SIGPIPE` / `EPIPE`
 * `strace` によるsystem call観察
@@ -35,6 +36,7 @@ C言語でTCP Echo Serverを実装し、単一の `epoll` イベントループ�
 * `epoll` を使ったI/O多重化
 * ノンブロッキングソケット
 * 複数クライアントの同時接続
+* `timerfd` による接続中クライアント数の定期報告
 * `accept4()` による
 
   * `SOCK_NONBLOCK`
@@ -95,12 +97,18 @@ epoll_wait()
    |             EPOLLOUTを追加
    |
    +-- client に EPOLLOUT
+   |       |
+   |     未送信データの続きからwrite
+   |       |
+   |       +-- 全部送信
+   |               |
+   |             EPOLLOUTを解除
+   |
+   +-- timerfd に EPOLLIN（10秒ごと）
            |
-         未送信データの続きからwrite
+         timerの満了回数をread
            |
-           +-- 全部送信
-                   |
-                 EPOLLOUTを解除
+         接続中のクライアント数を報告
 ```
 
 ## クライアントごとの状態管理
@@ -201,6 +209,23 @@ TCP port `8080` で待ち受けます。
 ```text
 listening on 8080
 ```
+
+## 接続数の定期モニタリング
+
+サーバーはノンブロッキングな `timerfd` を作成し、listener socketやclient
+socketと同じ `epoll` インスタンスへ登録します。timerは10秒ごとに満了するため、
+別スレッドやsignal handlerを使わず、イベントループ内で定期処理を実行できます。
+
+timerイベントを受け取るたびに、現在接続中のクライアント数と、`read()` で取得した
+timerの満了回数を表示します。
+
+```text
+active clients: 3
+timer fired: 1 time(s)
+```
+
+満了回数は通常 `1` です。イベントループがtimerをすぐに処理できなかった場合は、
+`timerfd` が未処理の満了回数を蓄積するため、`2` 以上になることがあります。
 
 ## 手動テスト
 
@@ -427,4 +452,3 @@ client B -> fd 5
 のように、closeされたfd番号は再利用されることがあります。
 
 そのため、このサーバーではfd番号だけをクライアント識別子として使わ
-
