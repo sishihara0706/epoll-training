@@ -9,15 +9,19 @@
 #include<sys/epoll.h>
 #include<errno.h>
 #include<signal.h>
+#include<sys/timerfd.h>
 
 #define PORT 8080
 #define EVENT_NUM 1000
 #define BUFF_SIZE 4096
 #define LISTEN_NUM 128
 
+static int active_clients;
+
 enum fd_type
 {
 	FD_LISTENER,
+	FD_TIMECONTROLLER,
 	FD_CLIENT
 };
 
@@ -33,6 +37,12 @@ struct st_client {
 	char outbuff[BUFF_SIZE+2];
 	size_t out_len; // 全体で何バイト送る予定か
 	size_t out_pos; // 何バイト目まで送信済みか
+};
+
+struct st_time_controller {
+	struct fd_info base;
+	// unique member
+	
 };
 
 static int flush_output(struct st_client *client)
@@ -108,6 +118,8 @@ static int accept_client(int epoll_fd, int sfd)
 				return -1; 
 			}
 			printf("connected. client fd:%d\n", cfd);
+
+			active_clients++; // 現在の接続数を+1
 			
 			// さらに接続待ちが残っているかもしれないので続ける
 			continue;
@@ -239,10 +251,42 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 			{
 				break;
 			}
+			if( nr == -1 && errno == ECONNRESET )
+			{
+				printf("receive ECONNRESET. disconnected. client fd:%d\n", client->base.fd); 
+				return 1;
+			} 
 			perror("read");
 			return -1;
 		}
 	}
+	return 0;
+}
+
+static int health_check(int tfd)
+{
+	uint64_t expirations;
+	ssize_t nr;
+
+	for(;;)
+	{
+		nr = read(tfd, &expirations, sizeof(expirations));
+		if( nr == sizeof(expirations) )
+		{	
+			printf("active clients: %d\n", active_clients);
+			printf("timer fired: %llu time(s)\n", (unsigned long long)expirations);
+			break;
+		}
+		if ( nr < 0 )
+		{
+			if(errno == EAGAIN || errno == EWOULDBLOCK) { break; }
+			if(errno == EINTR) { continue; }
+			
+			perror("read timerfd");
+			return -1;
+		}
+	}
+
 	return 0;
 }
 
@@ -302,6 +346,39 @@ int main (void)
 		return -1;
 	}
 
+	// setup timerfd
+	int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	if(timer_fd == -1)
+	{
+		perror("timerfd_create");
+		return -1;
+	}
+
+	struct itimerspec timer = {0};
+	timer.it_value.tv_sec = 1;
+	timer.it_interval.tv_sec = 1;
+	if(timerfd_settime(timer_fd, 0, &timer, NULL) == -1)
+	{
+		perror("timerfd_settime");
+		return -1;
+	}
+
+	// timer用のfd_infoを作成
+	struct fd_info time_controller = {
+		.type = FD_TIMECONTROLLER,
+		.fd = timer_fd
+	};
+
+	struct epoll_event tev = {0};
+	tev.events = EPOLLIN;
+	tev.data.ptr = &time_controller;
+
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &tev) == -1)
+	{
+		perror("epoll_ctl");
+		return -1;
+	}
+
 	struct epoll_event events[EVENT_NUM];
 	printf("listening on 8080\n");
 
@@ -330,7 +407,15 @@ int main (void)
 					return -1;
 				}
 			}
-			else
+			else if(info->type == FD_TIMECONTROLLER)
+			{
+				if(health_check(info->fd) == -1)
+				{
+					close(info->fd);
+					return -1;
+				}
+			}
+			else if(info->type == FD_CLIENT)
 			{
 				struct st_client *client = events[n].data.ptr;
 				// clientからのメッセージ受信
@@ -344,6 +429,7 @@ int main (void)
 				else if (ret == 1)
 				{
 					close(client->base.fd);
+					active_clients--;
 					free(client);
 					continue;
 				}
@@ -351,6 +437,10 @@ int main (void)
 				{
 					;
 				}
+			}
+			else
+			{
+				;
 			}
 		}
 	}
