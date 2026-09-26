@@ -296,11 +296,18 @@ int main (void)
 
 	int sfd, nfds;
 	int n;
+	int opt;
 	struct sockaddr_in my_addr;	
 	sfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if(sfd == -1)
 	{
 		perror("socket");
+		return -1;
+	}
+
+	if(setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
+	{
+		perror("setsockopt");
 		return -1;
 	}
 
@@ -355,8 +362,8 @@ int main (void)
 	}
 
 	struct itimerspec timer = {0};
-	timer.it_value.tv_sec = 1;
-	timer.it_interval.tv_sec = 1;
+	timer.it_value.tv_sec = 10;
+	timer.it_interval.tv_sec = 10;
 	if(timerfd_settime(timer_fd, 0, &timer, NULL) == -1)
 	{
 		perror("timerfd_settime");
