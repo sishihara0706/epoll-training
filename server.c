@@ -295,7 +295,7 @@ static int health_check(int tfd)
 static int handle_signal(int fd)
 {
 	struct signalfd_siginfo fdsi;
-	int nr;
+	ssize_t nr;
 
 	for(;;)
 	{
@@ -320,11 +320,11 @@ static int handle_signal(int fd)
 		}	
 		if(nr < 0)
 		{
-			if (nr == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
 			{
 				return 0;
 			}
-			if (nr == -1 && errno == EINTR) 
+			if (errno == EINTR) 
 			{
 				continue;
 			}
