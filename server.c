@@ -340,7 +340,7 @@ int main (void)
 	signal(SIGPIPE, SIG_IGN); // SIGPIPEを無視する
 
 	/*
- 	 * tcp definition
+ 	 * tcp variable definition
  	 */
 	int sfd, nfds;
 	int n;
@@ -348,7 +348,7 @@ int main (void)
 	struct sockaddr_in my_addr;	
 
 	/*
- 	 * signalfd definition
+ 	 * signalfd variable definition
  	 */
 	int signal_fd;
 	sigset_t mask;
@@ -382,7 +382,6 @@ int main (void)
 		return -1;
 	}
 
-	// epollオブジェクト作成
 	int epoll_fd = epoll_create1(0);
 	if(epoll_fd == -1 )
 	{
@@ -391,7 +390,6 @@ int main (void)
 
 	}
 
-	// listener用のfd_infoを作成
 	struct fd_info listener = {
 		.type = FD_LISTENER,
 		.fd = sfd
@@ -407,7 +405,6 @@ int main (void)
 		return -1;
 	}
 
-	// setup timerfd
 	int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 	if(timer_fd == -1)
 	{
@@ -424,7 +421,6 @@ int main (void)
 		return -1;
 	}
 
-	// timer用のfd_infoを作成
 	struct fd_info timer_info = {
 		.type = FD_TIMER,
 		.fd = timer_fd
@@ -493,7 +489,6 @@ int main (void)
 
 		for (n = 0; n < nfds; n++)
 		{
-			// int fd = events[n].data.fd;
 			struct fd_info *info = events[n].data.ptr;
 
 			if (info->type == FD_LISTENER)
