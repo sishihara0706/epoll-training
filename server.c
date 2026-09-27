@@ -18,7 +18,6 @@
 #define LISTEN_NUM 128
 
 static int active_clients;
-static int signal_flag;
 
 enum fd_type
 {
@@ -306,21 +305,21 @@ static int handle_signal(int fd)
 			if(fdsi.ssi_signo == SIGINT)
 			{
 				printf("Got SIGINT\n");
-				signal_flag = 1;
 				return 1;
 			}
 			if(fdsi.ssi_signo == SIGTERM) 
 			{
 				printf("Got SIGTERM\n");
-				signal_flag = 1;
 				return 1;
 			}
 			if(fdsi.ssi_signo == SIGQUIT) 
 			{
 				printf("Got SIGQUIT\n");
-				signal_flag = 1;
 				return 1;
 			}
+		}	
+		if(nr < 0)
+		{
 			if (nr == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
 			{
 				return 0;
@@ -332,7 +331,7 @@ static int handle_signal(int fd)
 
 			perror("read signal");
 			return -1;
-		}	
+		}
 	}
 }
 
@@ -345,7 +344,7 @@ int main (void)
  	 */
 	int sfd, nfds;
 	int n;
-	int opt;
+	int opt = 1;
 	struct sockaddr_in my_addr;	
 
 	/*
@@ -455,7 +454,7 @@ int main (void)
 		return -1;
 	}
 
-	signal_fd = signalfd(-1, &mask, 0);
+	signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
 	if(signal_fd == -1)
 	{
 		perror("signalfd");
