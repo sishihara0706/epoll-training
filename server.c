@@ -10,6 +10,7 @@
 #include<errno.h>
 #include<signal.h>
 #include<sys/timerfd.h>
+#include<sys/signalfd.h>
 
 #define PORT 8080
 #define EVENT_NUM 1000
@@ -17,11 +18,13 @@
 #define LISTEN_NUM 128
 
 static int active_clients;
+static int signal_flag;
 
 enum fd_type
 {
 	FD_LISTENER,
-	FD_TIMECONTROLLER,
+	FD_TIMER,
+	FD_SIGNAL,
 	FD_CLIENT
 };
 
@@ -39,7 +42,7 @@ struct st_client {
 	size_t out_pos; // 何バイト目まで送信済みか
 };
 
-struct st_time_controller {
+struct st_timer_info {
 	struct fd_info base;
 	// unique member
 	
@@ -290,21 +293,73 @@ static int health_check(int tfd)
 	return 0;
 }
 
+static int handle_signal(int fd)
+{
+	struct signalfd_siginfo fdsi;
+	int nr;
+
+	for(;;)
+	{
+		nr = read(fd, &fdsi, sizeof(fdsi));
+		if (nr == sizeof(fdsi))
+		{
+			if(fdsi.ssi_signo == SIGINT)
+			{
+				printf("Got SIGINT\n");
+				signal_flag = 1;
+				return 1;
+			}
+			if(fdsi.ssi_signo == SIGTERM) 
+			{
+				printf("Got SIGTERM\n");
+				signal_flag = 1;
+				return 1;
+			}
+			if(fdsi.ssi_signo == SIGQUIT) 
+			{
+				printf("Got SIGQUIT\n");
+				signal_flag = 1;
+				return 1;
+			}
+			if (nr == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			{
+				return 0;
+			}
+			if (nr == -1 && errno == EINTR) 
+			{
+				continue;
+			}
+
+			perror("read signal");
+			return -1;
+		}	
+	}
+}
+
 int main (void)
 {
 	signal(SIGPIPE, SIG_IGN); // SIGPIPEを無視する
 
+	/*
+ 	 * tcp definition
+ 	 */
 	int sfd, nfds;
 	int n;
 	int opt;
 	struct sockaddr_in my_addr;	
+
+	/*
+ 	 * signalfd definition
+ 	 */
+	int signal_fd;
+	sigset_t mask;
+
 	sfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if(sfd == -1)
 	{
 		perror("socket");
 		return -1;
 	}
-
 	if(setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
 	{
 		perror("setsockopt");
@@ -371,16 +426,52 @@ int main (void)
 	}
 
 	// timer用のfd_infoを作成
-	struct fd_info time_controller = {
-		.type = FD_TIMECONTROLLER,
+	struct fd_info timer_info = {
+		.type = FD_TIMER,
 		.fd = timer_fd
 	};
 
-	struct epoll_event tev = {0};
-	tev.events = EPOLLIN;
-	tev.data.ptr = &time_controller;
+	struct epoll_event timer_ev = {0};
+	timer_ev.events = EPOLLIN;
+	timer_ev.data.ptr = &timer_info;
 
-	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &tev) == -1)
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &timer_ev) == -1)
+	{
+		perror("epoll_ctl");
+		return -1;
+	}
+
+	/*
+ 	 * signal setting
+ 	 */
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGTERM);
+	sigaddset(&mask, SIGQUIT);	
+	
+	if(sigprocmask(SIG_BLOCK,&mask, NULL) == -1)
+	{
+		perror("sigprocmask");
+		return -1;
+	}
+
+	signal_fd = signalfd(-1, &mask, 0);
+	if(signal_fd == -1)
+	{
+		perror("signalfd");
+		return -1;
+	}
+	
+	struct fd_info signal_info = {
+		.type = FD_SIGNAL,
+		.fd = signal_fd
+	};
+
+	struct epoll_event signal_ev = {0};
+	signal_ev.events = EPOLLIN;
+	signal_ev.data.ptr = &signal_info;
+
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, signal_fd, &signal_ev) == -1)
 	{
 		perror("epoll_ctl");
 		return -1;
@@ -414,12 +505,39 @@ int main (void)
 					return -1;
 				}
 			}
-			else if(info->type == FD_TIMECONTROLLER)
+			else if(info->type == FD_TIMER)
 			{
 				if(health_check(info->fd) == -1)
 				{
 					close(info->fd);
 					return -1;
+				}
+			}
+			else if(info->type == FD_SIGNAL)
+			{
+				int ret = handle_signal(info->fd);
+				
+				if(ret == -1)
+				{
+					close(info->fd);
+					return -1;
+				}
+				else if(ret == 1)
+				{
+					printf("Clean up and Exit.\n");
+					close(sfd);
+					close(timer_fd);
+					close(signal_fd);
+					close(epoll_fd);
+					return 0;
+				}
+				else if(ret == 0)
+				{
+					continue;
+				}
+				else
+				{
+					;
 				}
 			}
 			else if(info->type == FD_CLIENT)
@@ -451,8 +569,6 @@ int main (void)
 			}
 		}
 	}
-	close(sfd);
-	close(epoll_fd);
 
 	return 0;
 }
