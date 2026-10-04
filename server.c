@@ -36,7 +36,10 @@ struct fd_info
 struct st_client {
 	struct fd_info base;
 
-	char outbuff[BUFF_SIZE+2];
+	char in_buf[BUFF_SIZE+1];
+	size_t in_len;
+
+	char out_buf[BUFF_SIZE+2];
 	size_t out_len; // 全体で何バイト送る予定か
 	size_t out_pos; // 何バイト目まで送信済みか
 };
@@ -53,9 +56,18 @@ static int flush_output(struct st_client *client)
 
 	while(client->out_pos < client->out_len)
 	{
-		nw = write(client->base.fd, client->outbuff + client->out_pos, client->out_len - client->out_pos);
+		nw = write(client->base.fd, client->out_buf + client->out_pos, client->out_len - client->out_pos);
 		if(nw > 0)
 		{
+			printf(
+					"write fd=%d nw=%zd pos=%zu/%zu func=%s\n",
+					client->base.fd,
+					nw,
+					client->out_pos + nw,
+					client->out_len,
+					__func__
+				  );
+
 			client->out_pos += nw;
 			continue;
 		}
@@ -99,6 +111,17 @@ static int accept_client(int epoll_fd, int sfd)
 
 		if(cfd >= 0)
 		{
+			int sndbuf = 4096;
+			// テスト用
+			if(setsockopt(cfd,
+						SOL_SOCKET,
+						SO_SNDBUF,
+						&sndbuf,
+						sizeof(sndbuf)) == -1 )
+			{
+				perror("setsocket SO_SNDBUF");
+			}
+
 			client = calloc(1, sizeof(*client));
 			if(client == NULL)
 			{
@@ -136,109 +159,101 @@ static int accept_client(int epoll_fd, int sfd)
 	return 0;
 }
 
+int process_input(struct st_client *client)
+{
+	if(client->out_len != 0)
+	{
+		return 0;
+	}
+
+	char *p = memchr(client->in_buf, '\n', client->in_len);
+	if( p == NULL )
+	{
+		return 0;
+	}
+
+	size_t line_len = (size_t)(p - client->in_buf) + 1;
+	memcpy(client->out_buf, client->in_buf, line_len);
+
+	client->out_len = line_len;
+	client->out_pos = 0;
+
+	size_t remain = client->in_len - line_len;
+	memmove(client->in_buf, p + 1, remain);
+	client->in_len = remain;
+	
+	return 1;	
+}
+
+static int process_and_flush(struct st_client *client)
+{
+	for(;;)
+	{
+		if(client->out_len == 0)
+		{
+			if(!process_input(client))
+			{
+				break;
+			}
+		}
+
+		int ret = flush_output(client);
+		if(ret != 0)
+		{
+			return ret;
+		}
+
+		if(client->out_pos < client->out_len)
+		{
+			// まだout_bufの中をすべて送りきれていない
+			break;
+		}
+
+		client->out_pos = 0;
+		client->out_len = 0;
+	}
+	return 0;	
+}
+
 static int handle_client(int epoll_fd, struct st_client *client, uint32_t events)
 {
-	char buff[BUFF_SIZE+1];	
 	ssize_t nr;
 	
 	if(events & EPOLLOUT)
 	{
 		printf("EPOLLOUT fd=%d\n", client->base.fd);
-		int ret = flush_output(client);
-		if(ret == -1)
+		int ret = process_and_flush(client);
+		if(ret != 0)
 		{
-			return -1;
-		}
-		else if(ret == 1)
-		{
-			return 1; // 閉じているclientに書き込もうとした
-		}
-		else if(client->out_pos == client->out_len)
-		{
-			client->out_pos = 0;
-			client->out_len = 0;
-			struct epoll_event ev = {
-				.events = EPOLLIN,
-				.data.ptr = client
-			};
-
-			if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
-			{ 
-				perror("epoll_ctl"); 
-				return -1; 
-			}
-		}
-		else
-		{
-			struct epoll_event ev = {
-				.events = EPOLLIN | EPOLLOUT,
-				.data.ptr = client
-			};
-
-			if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
-			{ 
-				perror("epoll_ctl"); 
-				return -1; 
-			}
-			return 0; // まだ未送信なのでEPOLLINを処理しない
+			return ret;
 		}
 	}
 
 	if(events & EPOLLIN)
 	{
+		printf("EPOLLIN fd=%d\n", client->base.fd);
 		for(;;)
 		{
-			nr = read(client->base.fd, buff, BUFF_SIZE);
+			if(client->in_len == BUFF_SIZE)
+			{
+				fprintf(stderr, "input buffer full fd=%d\n", client->base.fd);
+				return -1;
+			}
+			nr = read(
+				client->base.fd, 
+				client->in_buf + client->in_len,
+				BUFF_SIZE - client->in_len
+			);
 
 			if(nr > 0)
 			{
-				client->out_pos = 0;
-
-				//read は'\0'をつけないので自分でつける
-				buff[nr] = '\0';
-				buff[strcspn(buff, "\r\n")] = '\0';
-				printf("receive from client fd%d, message:%s\n", client->base.fd, buff);
-
-				client->out_len = snprintf(client->outbuff, sizeof(client->outbuff), "%s\n", buff);
-				int ret = flush_output(client);
-				if(ret == -1)
+				client->in_len += nr;
+				int ret = process_and_flush(client);
+				if(ret != 0)
 				{
-					return -1;
+					break;
 				}
-				else if(ret == 1)
-				{
-					return 1;
-				}
-				else if(client->out_pos == client->out_len)
-				{
-					client->out_pos = 0;
-					client->out_len = 0;
-					struct epoll_event ev = {
-						.events = EPOLLIN,
-						.data.ptr = client
-					};
-
-					if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
-					{ 
-						perror("epoll_ctl"); 
-						return -1; 
-					}
-					continue;
-				}
-				else
-				{
-					struct epoll_event ev = {
-						.events = EPOLLIN | EPOLLOUT,
-						.data.ptr = client
-					};
-
-					if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
-					{ 
-						perror("epoll_ctl"); 
-						return -1; 
-					}
-					return 0; // まだ未送信なのでEPOLLINを処理しない
-				}
+				continue;
 			}
 			if(nr == 0)
 			{
@@ -262,6 +277,25 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 			return -1;
 		}
 	}
+
+	uint32_t wanted = EPOLLIN;
+
+	if(client->out_pos < client->out_len)
+	{
+		wanted |= EPOLLOUT;
+	}
+
+	struct epoll_event ev = {
+		.events = wanted,
+		.data.ptr = client
+	};
+
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->base.fd, &ev)==-1) 
+	{ 
+		perror("epoll_ctl"); 
+		return -1; 
+	}
+
 	return 0;
 }
 
@@ -541,9 +575,11 @@ int main (void)
 				int ret = handle_client(epoll_fd, client, events[n].events);
 				if(ret == -1)
 				{
+					fprintf(stderr, "get -1 from handle_client,\nsocket close fd=%d\n", client->base.fd);
 					close(client->base.fd);
+					active_clients--;
 					free(client);
-					return -1;
+					continue;
 				}
 				else if (ret == 1)
 				{
