@@ -218,6 +218,7 @@ static int process_and_flush(struct st_client *client)
 static int handle_client(int epoll_fd, struct st_client *client, uint32_t events)
 {
 	ssize_t nr;
+	uint32_t wanted;
 	
 	if(events & EPOLLOUT)
 	{
@@ -226,6 +227,10 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 		if(ret != 0)
 		{
 			return ret;
+		}
+		if(client->out_pos < client->out_len)
+		{
+			goto update_events;
 		}
 	}
 
@@ -253,6 +258,12 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 				{
 					break;
 				}
+
+				if(client->out_pos < client->out_len)
+				{
+					break;
+				}
+
 				continue;
 			}
 			if(nr == 0)
@@ -278,11 +289,15 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 		}
 	}
 
-	uint32_t wanted = EPOLLIN;
+update_events:
 
 	if(client->out_pos < client->out_len)
 	{
-		wanted |= EPOLLOUT;
+		wanted = EPOLLOUT;
+	}
+	else
+	{
+		wanted = EPOLLIN;
 	}
 
 	struct epoll_event ev = {
