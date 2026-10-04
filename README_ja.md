@@ -1,454 +1,281 @@
 # epoll-training
 
-Linux の `epoll`、ノンブロッキングI/O、TCPソケットの挙動、イベント駆動型サーバー設計を学ぶためのハンズオンプロジェクトです。
+Linux の `epoll`、ノンブロッキング I/O、TCP ストリーム処理、バックプレッシャーを C 言語で学ぶためのハンズオンプロジェクトです。
 
-C言語でTCP Echo Serverを実装し、単一の `epoll` イベントループで複数クライアントを同時に処理します。
-
-また、ShellとPythonによる負荷試験も用意し、接続処理、TCPバッファ、バックプレッシャー、`EAGAIN`、`EPOLLOUT` などを実際に観察できるようにしています。
+実装は改行区切りの TCP Echo Server です。単一の `epoll` イベントループで、リスナー、クライアントソケット、定期処理用の `timerfd`、終了処理用の `signalfd` を扱います。
 
 [English version](README.md)
 
-## 目的
-
-このプロジェクトの主な目的は、Linux上のネットワークサーバーがフレームワークの下でどのように動作しているかを理解することです。
-
-主に以下のテーマを扱っています。
-
-* `select` / `poll` / `epoll`
-* ノンブロッキングソケット
-* `EPOLLIN` / `EPOLLOUT`
-* partial read / partial write
-* `EAGAIN` / `EWOULDBLOCK`
-* `EINTR`
-* TCP送受信バッファ
-* `Recv-Q` / `Send-Q`
-* TCPバックプレッシャー
-* クライアントごとの状態管理
-* `timerfd` を利用した定期処理
-* file descriptorの再利用
-* `SIGPIPE` / `EPIPE`
-* `strace` によるsystem call観察
-* `ss` によるTCP状態観察
-
 ## 主な機能
 
-* C言語によるTCP Echo Server
-* `epoll` を使ったI/O多重化
-* ノンブロッキングソケット
-* 複数クライアントの同時接続
-* `timerfd` による接続中クライアント数の定期報告
-* `accept4()` による
+- level-triggered な単一の `epoll` ループによる複数クライアント処理
+- `socket()` と `accept4()` で作成する non-blocking／close-on-exec ソケット
+- `epoll_event.data.ptr` を使ったクライアントごとの入出力状態管理
+- TCP の分割・結合された read に対応する改行ベースのメッセージ分割
+- partial write と `EPOLLOUT` への対応
+- Echo の未送信データがある間の read-side バックプレッシャー
+- `timerfd` による接続中クライアント数の定期表示
+- `signalfd` によるイベントループ内でのシグナル処理
+- `EPIPE` や connection reset を含むクライアント単位のエラー処理
+- 通常負荷、slow reader、no reader のテストプログラム
 
-  * `SOCK_NONBLOCK`
-  * `SOCK_CLOEXEC`
-    の設定
-* `epoll_event.data.ptr` を利用したクライアント状態管理
-* partial writeへの対応
-* 書き込み完了できない場合のみ `EPOLLOUT` を登録
-* `EINTR` のリトライ処理
-* `EAGAIN` / `EWOULDBLOCK` の処理
-* クライアント切断処理
-* `SIGPIPE` / `EPIPE` の考慮
-* Shellによる同時接続テスト
-* Python `asyncio` による負荷試験
-* slow readerによるTCPバックプレッシャー試験
+## 最近の更新
 
-## アーキテクチャ
+元の README に反映されていなかった最近の変更は次のとおりです。
 
-サーバーは典型的なイベント駆動型の構成になっています。
+- 入力をクライアントごとに蓄積し、完全な1行単位で Echo するようになりました。TCP の read 境界をメッセージ境界とはみなしません。
+- 入力バッファ内に完全な行が複数ある場合も、順番に処理します。
+- レスポンスをすべて送信できなかった場合は、そのクライアントを `EPOLLOUT` だけで監視します。未送信データの送信後に read を再開することで、アプリケーションのバッファ使用量を制限し、送信元までバックプレッシャーを伝えます。
+- `SIGINT`、`SIGTERM`、`SIGQUIT` を block して `signalfd` から読み取り、終了処理も `epoll` イベントループ内で行うようになりました。
+- build、run、clean の標準ターゲットを持つ `Makefile` を追加しました。
+- 継続的なバックプレッシャーを意図的に起こす `no_reader_test.py` を追加しました。
 
-```text
-socket()
-   |
-bind()
-   |
-listen()
-   |
-epoll_create1()
-   |
-listener socket を epoll に登録
-   |
-epoll_wait()
-   |
-   +-- listener に EPOLLIN
-   |       |
-   |     accept4()
-   |       |
-   |     client状態を確保
-   |       |
-   |     client socketをepollへ登録
-   |
-   +-- client に EPOLLIN
-   |       |
-   |     read()
-   |       |
-   |     echo用データを作成
-   |       |
-   |     writeできるだけ送信
-   |       |
-   |       +-- 全部送信できた
-   |       |       |
-   |       |     EPOLLINのみ監視
-   |       |
-   |       +-- EAGAIN
-   |               |
-   |             未送信データを保持
-   |               |
-   |             EPOLLOUTを追加
-   |
-   +-- client に EPOLLOUT
-   |       |
-   |     未送信データの続きからwrite
-   |       |
-   |       +-- 全部送信
-   |               |
-   |             EPOLLOUTを解除
-   |
-   +-- timerfd に EPOLLIN（10秒ごと）
-           |
-         timerの満了回数をread
-           |
-         接続中のクライアント数を報告
-```
+## イベントループの構成
 
-## クライアントごとの状態管理
-
-各クライアントごとに送信状態を保持します。
+登録する各 descriptor は、先頭に共通のヘッダーを持ちます。
 
 ```c
-struct st_client {
-    struct fd_info base;
-
-    char outbuff[BUFF_SIZE + 2];
-    size_t out_len;
-    size_t out_pos;
+struct fd_info {
+    enum fd_type type;
+    int fd;
 };
 ```
 
-`out_len` は送信予定の総バイト数です。
-
-`out_pos` はすでに送信済みのバイト数です。
-
-例えば、
+`epoll_event.data.ptr` はこのヘッダー、または同じヘッダーを先頭メンバーに持つクライアント構造体を指します。イベントループは descriptor の種類によって処理を振り分けます。
 
 ```text
-out_len = 1000
-out_pos = 600
-```
-
-であれば、残り400 byteを送信する必要があります。
-
-この状態を `epoll_wait()` をまたいで保持します。
-
-## なぜEPOLLOUTが必要なのか
-
-ノンブロッキングソケットでは、`write()` が要求された全データを一度に送信できる保証はありません。
-
-例えば、
-
-```text
-1000 bytes送信したい
-        |
-write() -> 600 bytes
-        |
-write() -> -1 / EAGAIN
-        |
-残り400 bytes
-        |
-EPOLLOUTを有効化
-        |
 epoll_wait()
+   |
+   +-- listener / EPOLLIN
+   |     EAGAIN まで accept4()
+   |
+   +-- client / EPOLLIN
+   |     client の入力バッファへ read
+   |     改行で区切られた完全なメッセージを取り出す
+   |     socket が許す範囲で Echo を write
+   |
+   +-- client / EPOLLOUT
+   |     partial write の続きから再開
+   |
+   +-- timerfd / EPOLLIN
+   |     10秒ごとに接続中の client 数を表示
+   |
+   +-- signalfd / EPOLLIN
+         終了 signal を読み取って shutdown
+```
+
+listener は `accept4()` が `EAGAIN` を返すまで処理します。クライアントの read／write も同様に、処理できなくなるまで繰り返してからイベントループへ戻ります。
+
+## TCP のメッセージ分割
+
+TCP は byte stream です。送信側の1回の `write()` と受信側の1回の `read()` が対応する保証はありません。例えば、
+
+```text
+alpha\n
+beta\n
+```
+
+という2回の書き込みが1回の read にまとまることも、1行が複数の read に分割されることもあります。
+
+そのため、各クライアントは入力バッファを持ちます。
+
+```c
+char in_buf[BUFF_SIZE + 1];
+size_t in_len;
+```
+
+サーバーは不完全な入力を保持し、`\n` を探して完全な1行だけを出力バッファへ移します。残ったデータは次のメッセージとして入力バッファに保持します。改行がないまま 4096 byte の入力バッファを使い切った場合はエラーとし、そのクライアントを切断します。
+
+## Partial write とバックプレッシャー
+
+non-blocking な `write()` は、レスポンスの一部だけを送信したり、`EAGAIN` を返したりします。クライアント構造体は event loop をまたいで送信位置を保持します。
+
+```c
+char out_buf[BUFF_SIZE + 2];
+size_t out_len;
+size_t out_pos;
+```
+
+例えば `out_len = 1000`、`out_pos = 600` なら、残りは 400 byte です。
+
+```text
+完全な1行を取得
         |
-socketが再びwrite可能になる
+        v
+可能な範囲まで write
         |
-600 byte目から送信を再開
+        +-- 送信完了 ------------> EPOLLIN を監視
+        |
+        +-- EAGAIN / partial write
+                |
+                v
+          out_pos を保持
+          EPOLLOUT のみ監視
+                |
+                v
+          残りを送信
+          EPOLLIN を再開
 ```
 
-という動きになります。
+`EPOLLIN` を一時的に無効にするのは意図した動作です。レスポンスを届けられないクライアントからリクエストだけを読み続けることを防ぎ、kernel の受信バッファと TCP flow control を通して送信元へ圧力を伝えます。未送信データがなくなれば `EPOLLOUT` もすぐ解除するため、不要な writable 通知は発生し続けません。
 
-通常は、
+## ビルドと実行
 
-```text
-EPOLLIN
-```
-
-のみを監視します。
-
-`write()` が完了できず、
-
-```text
--1 / EAGAIN
-```
-
-になった場合だけ、
-
-```text
-EPOLLIN | EPOLLOUT
-```
-
-へ変更します。
-
-未送信データをすべて送信したら、再び `EPOLLOUT` を解除します。
-
-これにより、送信データがないのに `EPOLLOUT` が大量に通知され続けることを防ぎます。
-
-## ビルド
+Linux、GCC または互換 C compiler、GNU Make が必要です。テストプログラムには Python 3 も使用します。
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Og -g server.c -o server
+make
+make run
 ```
 
-## 実行
-
-```bash
-./server
-```
-
-TCP port `8080` で待ち受けます。
+サーバーは全 interface の TCP port `8080` で待ち受けます。
 
 ```text
 listening on 8080
 ```
 
-## 接続数の定期モニタリング
+生成した binary を削除する場合は次を実行します。
 
-サーバーはノンブロッキングな `timerfd` を作成し、listener socketやclient
-socketと同じ `epoll` インスタンスへ登録します。timerは10秒ごとに満了するため、
-別スレッドやsignal handlerを使わず、イベントループ内で定期処理を実行できます。
-
-timerイベントを受け取るたびに、現在接続中のクライアント数と、`read()` で取得した
-timerの満了回数を表示します。
-
-```text
-active clients: 3
-timer fired: 1 time(s)
+```bash
+make clean
 ```
 
-満了回数は通常 `1` です。イベントループがtimerをすぐに処理できなかった場合は、
-`timerfd` が未処理の満了回数を蓄積するため、`2` 以上になることがあります。
+直接コンパイルする場合の同等のコマンドは次のとおりです。
 
-## 手動テスト
+```bash
+gcc -Wall -Wextra -Wpedantic -Og -g server.c -o server
+```
 
-別ターミナルから `nc` で接続します。
+`SO_REUSEADDR` を有効にしているため、以前の TCP 状態が残っていても通常はすぐにサーバーを再起動できます。
+
+## 終了処理
+
+`Ctrl-C`、`SIGTERM`、または `SIGQUIT` でサーバーを停止できます。
+
+```bash
+kill -TERM "$(pidof server)"
+```
+
+これらの signal は通常の配送経路では block され、non-blocking な `signalfd` から読み取られます。この descriptor も `epoll` に登録されているため、signal 処理は他のイベントと同じ流れで同期的に行われます。signal を受け取ると、listener、timer、signal、epoll の各 descriptor を閉じて終了します。
+
+これはプロセスの制御された終了ですが、未送信のクライアントレスポンスを drain してから終了する実装ではありません。
+
+## テスト
+
+一方の terminal でサーバーを起動してから、別の terminal で以下を実行します。
+
+### 手動 Echo テスト
 
 ```bash
 nc 127.0.0.1 8080
 ```
 
-例:
+改行で終わる各メッセージが1回ずつそのまま返ります。
 
-```text
-hello
-hello
-```
-
-複数のターミナルから同時に接続することで、複数クライアントの処理を確認できます。
-
-## 同時接続テスト
-
-Shellスクリプトを使って、多数のクライアントを並列に接続できます。
-
-例:
+### 同時接続テスト
 
 ```bash
-for i in $(seq 1 100); do
-    {
-        printf "client-%d\n" "$i"
-        sleep 5
-    } | nc 127.0.0.1 8080 &
-done
-
-wait
+./clients-connect.sh
 ```
 
-このテストでは、およそ100クライアントを同時接続し、それぞれの接続を処理できることを確認しました。
+100個の `nc` クライアントを同時に開き、それぞれ異なる時間だけ接続を維持します。
 
-## Python負荷試験
+### Request／response 負荷試験
 
-このリポジトリには、Pythonの `asyncio` を利用したテストも含まれています。
-
-典型的な負荷試験では、多数のクライアントが並行して接続し、繰り返しEchoリクエストを送信します。
-
-例えば、
-
-```text
-100 clients
-x
-1000 messages
-=
-100,000 echo requests
+```bash
+python3 load_test.py
 ```
 
-のような負荷を与えることができます。
+デフォルトでは100クライアントを作り、クライアントごとに1000個の行単位リクエストを送信します。すべての Echo を待った後、経過時間と1秒あたりのメッセージ数を表示します。
 
-これにより以下を確認できます。
+### Slow reader テスト
 
-* 複数クライアント同時接続
-* 連続したread / write
-* イベントループの挙動
-* 切断処理
-* 負荷時のsocket挙動
-
-## Slow Reader Test
-
-`EPOLLOUT` やTCPバックプレッシャーを確認するため、slow readerテストも用意しています。
-
-クライアント側は大量のデータをサーバーへ送信しますが、サーバーから返ってきたEchoレスポンスをすぐには読みません。
-
-概念的には以下の状態を作ります。
-
-```text
-client application
-      |
-      | 大量にsend
-      v
-server
-      |
-      | echo response
-      v
-client kernel receive buffer
-      |
-      | applicationがreadしない
-      v
-Recv-Qが増加
-      |
-      v
-TCP flow control
-      |
-      v
-server側のwriteが詰まる
-      |
-      v
-write() -> EAGAIN
-      |
-      v
-EPOLLOUT待ち
+```bash
+python3 slow_reader_test.py
 ```
 
-通常の小さなEcho通信では `write()` がすぐ成功してしまうため、このテストによって `EPOLLOUT` 処理を発生させやすくしています。
+100クライアントが多数のメッセージを送信し、レスポンスを読まないまま5秒待ってから切断します。これによりサーバー側の `write()` が `EAGAIN` になりやすい状態を作ります。
 
-## ssによるTCP状態観察
+### No reader テスト
 
-TCP接続状態は `ss` で確認できます。
+```bash
+python3 no_reader_test.py
+```
+
+1クライアントが100,000メッセージの送信を試み、Echo を一切読みません。リポジトリ内で最も強いバックプレッシャーテストで、TCP flow control がクライアントまで到達すると `sendall()` で block する場合があります。最後の sleep は観察のために接続を維持します。
+
+各 Python ファイル内の workload 値を小さくすれば、短時間で試せます。
+
+## サーバーの観察
+
+TCP queue は次のコマンドで確認できます。
 
 ```bash
 ss -tan
-```
-
-主な列は以下です。
-
-```text
-State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port
-```
-
-### Recv-Q
-
-`Recv-Q` は、
-
-> カーネルがすでに受信しているが、アプリケーションがまだ `read()` していないデータ量
-
-です。
-
-slow readerテストでは、クライアントアプリケーションがEchoレスポンスを読まないため、クライアント側の `Recv-Q` が大きくなる様子を確認できます。
-
-### Send-Q
-
-`Send-Q` は、
-
-> アプリケーションが `write()` したが、TCPスタック上でまだ完全に送信されていないデータ量
-
-です。
-
-さらに詳しいTCP情報を見る場合は、
-
-```bash
 ss -tin
 ```
 
-を利用できます。
+- `Recv-Q`: kernel が受信済みで、application がまだ読んでいないデータ
+- `Send-Q`: application が書き込み済みで、TCP stack 上ではまだ完全に配送されていないデータ
 
-## straceによるsystem call観察
-
-`strace` を使うと、イベントループ内部でどのsystem callが呼ばれているか確認できます。
+主要な system call は次のように追跡できます。
 
 ```bash
-strace -p $(pidof server) \
-  -e trace=epoll_wait,accept4,read,write
+strace -p "$(pidof server)" \
+  -e trace=epoll_wait,epoll_ctl,accept4,read,write
 ```
 
-例えば、1つのクライアントメッセージを処理すると、
+バックプレッシャーテスト中は、次の server log が手掛かりになります。
 
 ```text
-epoll_wait(...)
-read(...)
-write(...)
-read(...) = -1 EAGAIN
-epoll_wait(...)
+write EAGAIN fd=7 pos=600 len=1000
+EPOLLOUT fd=7
 ```
 
-のような流れを観察できます。
+最初の行は partial write の位置が保存されたことを示します。その後の `EPOLLOUT` event で、その位置から送信を再開します。
 
-これはサーバー内部の、
+## エラー処理
 
 ```text
-イベント待ち
-   |
-データをread
-   |
-Echoをwrite
-   |
-もう一度read
-   |
-EAGAIN
-   |
-epoll_waitへ戻る
+EINTR
+    中断された処理を retry
+
+EAGAIN / EWOULDBLOCK
+    状態を保持して epoll_wait() へ戻る
+
+EPIPE または ECONNRESET
+    影響を受けた client だけを close
+
+read() == 0
+    peer が正常に shutdown したため、その client を close
 ```
 
-という処理そのものです。
+`SIGPIPE` は無視し、socket write の失敗でプロセス全体が終了する代わりに `EPIPE` として扱います。クライアント固有のエラーでは接続数を減らし、サーバー自体は動作を続けます。
 
-新規接続では、
+## 学習テーマ
 
-```text
-epoll_wait(...)
-accept4(...)
-accept4(...) = -1 EAGAIN
-epoll_wait(...)
-```
+- level-triggered `epoll`
+- non-blocking socket と readiness-driven I/O
+- `accept4()`、`timerfd`、`signalfd`
+- TCP byte stream のメッセージ分割
+- partial read／partial write
+- `EAGAIN`、`EINTR`、`EPIPE`、connection reset の処理
+- TCP の送受信 queue と flow control
+- 接続ごとの状態管理と file descriptor の再利用
+- `ss` と `strace` による実行時の観察
 
-のようになります。
+## 開発について
 
-2回目の `accept4()` は意図した動作です。
+このサーバーは Linux systems programming の学習として段階的に実装し、負荷試験、`ss`、`strace` を使って挙動を確認してきました。Codex や ChatGPT などの AI coding assistant は、code review、debug の相談、edge case の検討、test 設計、document 作成の支援に使用しています。一度の生成で完成させたプロジェクトではありません。
 
-ノンブロッキングlistenerに対して `EAGAIN` が返るまで `accept4()` を繰り返し、accept待ちキューを処理します。
+## 現在の制約と今後の候補
 
-## EINTR
+- `EPOLLERR`、`EPOLLHUP`、`EPOLLRDHUP` の明示的な処理
+- graceful shutdown 時に接続中クライアントを drain
+- address、port、buffer size、logging の設定可能化
+- 自動 integration test
+- 接続数や throughput の統計
+- `select`、`poll`、edge-triggered `EPOLLET` との比較
+- より大規模な latency／throughput 計測
 
-system callはsignalによって中断される場合があります。
-
-例えば、
-
-```text
-epoll_wait(...) = -1 EINTR
-```
-
-となることがあります。
-
-この場合、サーバーを終了するのではなく、処理をリトライします。
-
-## File Descriptorの再利用
-
-file descriptor番号は永続的なクライアントIDではありません。
-
-例えば、
-
-```text
-client A -> fd 5
-
-close(fd 5)
-
-client B -> fd 5
-```
-
-のように、closeされたfd番号は再利用されることがあります。
-
-そのため、このサーバーではfd番号だけをクライアント識別子として使わ
+このリポジトリは意図的に小さく直接的な構成にしています。Linux のイベント駆動 networking を、コード・実行・観察を通して理解することが目的です。

@@ -1,598 +1,281 @@
 # epoll-training
 
-A hands-on Linux systems programming project for learning `epoll`, non-blocking I/O, TCP socket behavior, and event-driven server design in C.
+A hands-on Linux systems programming project for learning `epoll`, non-blocking I/O, TCP stream handling, and backpressure in C.
 
-The project implements a TCP echo server that supports multiple concurrent clients using a single `epoll` event loop. It also includes shell and Python load tests for observing connection handling, TCP buffering, backpressure, `EAGAIN`, and `EPOLLOUT`.
+The program is a newline-delimited TCP echo server. A single `epoll` event loop handles the listening socket, client sockets, a periodic `timerfd`, and a `signalfd` used for shutdown.
 
 [日本語版はこちら](README_ja.md)
 
-## Goals
-
-The main goal of this project is to understand how Linux network servers behave below the framework level.
-
-Topics explored include:
-
-* `select`, `poll`, and `epoll`
-* non-blocking sockets
-* `EPOLLIN` and `EPOLLOUT`
-* partial reads and partial writes
-* `EAGAIN` / `EWOULDBLOCK`
-* `EINTR`
-* TCP send and receive buffers
-* `Recv-Q` / `Send-Q`
-* backpressure
-* client state management
-* periodic processing with `timerfd`
-* file descriptor reuse
-* `SIGPIPE` / `EPIPE`
-* observing system calls with `strace`
-* observing TCP state with `ss`
-
 ## Features
 
-* TCP echo server written in C
-* `epoll`-based I/O multiplexing
-* non-blocking sockets
-* multiple concurrent clients
-* periodic reporting of active client connections with `timerfd`
-* `accept4()` with:
+- Multiple concurrent clients on one level-triggered `epoll` loop
+- Non-blocking, close-on-exec sockets created with `socket()` and `accept4()`
+- Per-client input and output buffers stored through `epoll_event.data.ptr`
+- Newline-based message framing across partial and combined TCP reads
+- Partial-write handling with `EPOLLOUT`
+- Read-side backpressure while an echo response is still pending
+- Periodic active-client reporting with `timerfd`
+- Signal handling inside the event loop with `signalfd`
+- Isolated client error handling, including `EPIPE` and connection resets
+- Load, slow-reader, and no-reader test programs
 
-  * `SOCK_NONBLOCK`
-  * `SOCK_CLOEXEC`
-* per-client state stored through `epoll_event.data.ptr`
-* partial write handling
-* `EPOLLOUT` registration only when a write cannot complete
-* retry handling for `EINTR`
-* handling of `EAGAIN` / `EWOULDBLOCK`
-* client disconnect handling
-* `SIGPIPE` / `EPIPE` handling
-* shell-based concurrent connection testing
-* Python `asyncio` load testing
-* slow-reader testing for TCP backpressure
+## Recent updates
 
-## Architecture
+The latest changes add behavior that was not covered by the original README:
 
-The server follows a typical event-driven design.
+- Input is accumulated per client and echoed one complete line at a time. TCP read boundaries are no longer treated as message boundaries.
+- Multiple complete lines already in the input buffer are processed in order.
+- When a response cannot be fully written, the client is monitored for `EPOLLOUT` only. Reading resumes after the pending response has been sent, which bounds application buffering and propagates backpressure to the sender.
+- `SIGINT`, `SIGTERM`, and `SIGQUIT` are blocked and consumed through `signalfd`, allowing shutdown to remain part of the `epoll` event loop.
+- A `Makefile` now provides standard build, run, and clean targets.
+- `no_reader_test.py` was added to deliberately exercise sustained backpressure.
 
-```text
-socket()
-   |
-bind()
-   |
-listen()
-   |
-epoll_create1()
-   |
-register listener with epoll
-   |
-epoll_wait()
-   |
-   +-- EPOLLIN on listener
-   |       |
-   |     accept4()
-   |       |
-   |     allocate client state
-   |       |
-   |     register client with epoll
-   |
-   +-- EPOLLIN on client
-   |       |
-   |     read()
-   |       |
-   |     prepare echo response
-   |       |
-   |     write as much as possible
-   |       |
-   |       +-- all data written
-   |       |       |
-   |       |     keep EPOLLIN only
-   |       |
-   |       +-- EAGAIN
-   |               |
-   |             keep remaining output
-   |               |
-   |             enable EPOLLOUT
-   |
-   +-- EPOLLOUT on client
-   |       |
-   |     resume pending write
-   |       |
-   |       +-- all data written
-   |               |
-   |             disable EPOLLOUT
-   |
-   +-- EPOLLIN on timerfd (every 10 seconds)
-           |
-         read timer expiration count
-           |
-         report active client connections
-```
+## Event-loop design
 
-## Per-client State
-
-Each client keeps its own output state.
+Each registered descriptor starts with a small common header:
 
 ```c
-struct st_client {
-    struct fd_info base;
-
-    char outbuff[BUFF_SIZE + 2];
-    size_t out_len;
-    size_t out_pos;
+struct fd_info {
+    enum fd_type type;
+    int fd;
 };
 ```
 
-`out_len` represents the total number of bytes that should be written.
-
-`out_pos` represents how many bytes have already been written.
-
-For example:
+`epoll_event.data.ptr` points to this header, or to a client structure whose first member is the same header. The event loop dispatches by descriptor type:
 
 ```text
-out_len = 1000
-out_pos = 600
-```
-
-means that 400 bytes still need to be sent.
-
-This state is preserved across `epoll_wait()` calls.
-
-## Why EPOLLOUT Is Needed
-
-With a non-blocking socket, `write()` does not guarantee that all requested bytes can be written immediately.
-
-For example:
-
-```text
-1000 bytes need to be sent
-        |
-write() -> 600 bytes
-        |
-write() -> -1 / EAGAIN
-        |
-400 bytes remain
-        |
-enable EPOLLOUT
-        |
 epoll_wait()
-        |
-socket becomes writable
-        |
-continue from byte 600
+   |
+   +-- listener / EPOLLIN
+   |     accept4() until EAGAIN
+   |
+   +-- client / EPOLLIN
+   |     read into the client's input buffer
+   |     extract complete newline-delimited messages
+   |     write echoes as far as the socket allows
+   |
+   +-- client / EPOLLOUT
+   |     resume a partial write
+   |
+   +-- timerfd / EPOLLIN
+   |     report the active-client count every 10 seconds
+   |
+   +-- signalfd / EPOLLIN
+         consume a termination signal and shut down
 ```
 
-The server normally monitors only:
+The listener is drained until `accept4()` returns `EAGAIN`. Client reads and writes similarly continue until they would block, which is required for efficient non-blocking I/O.
+
+## TCP framing
+
+TCP is a byte stream: one `write()` by the sender does not necessarily become one `read()` by the receiver. For example, these writes:
 
 ```text
-EPOLLIN
+alpha\n
+beta\n
 ```
 
-When a write cannot complete, it changes the monitored events to:
+may arrive in one read, or either line may be split across several reads.
+
+Each client therefore owns an input buffer:
+
+```c
+char in_buf[BUFF_SIZE + 1];
+size_t in_len;
+```
+
+The server keeps incomplete data, searches for `\n`, and moves one complete line at a time to the output buffer. Remaining bytes stay in the input buffer for the next message. A message that fills the 4096-byte input buffer without a newline is treated as an error and that client is closed.
+
+## Partial writes and backpressure
+
+Non-blocking `write()` may send only part of a response, or fail with `EAGAIN`. The client structure retains the write position across event-loop iterations:
+
+```c
+char out_buf[BUFF_SIZE + 2];
+size_t out_len;
+size_t out_pos;
+```
+
+For example, `out_len = 1000` and `out_pos = 600` means that 400 bytes remain.
 
 ```text
-EPOLLIN | EPOLLOUT
+complete line available
+        |
+        v
+write as much as possible
+        |
+        +-- response complete --> monitor EPOLLIN
+        |
+        +-- EAGAIN / partial write
+                |
+                v
+          preserve out_pos
+          monitor EPOLLOUT only
+                |
+                v
+          finish the response
+          resume EPOLLIN
 ```
 
-After the pending output has been fully written, `EPOLLOUT` is removed again.
+Temporarily disabling `EPOLLIN` is intentional. It prevents the application from continuing to consume requests from a client whose responses cannot be delivered. The kernel receive buffer then applies TCP flow control naturally. `EPOLLOUT` is disabled again as soon as no output is pending, avoiding continuous writable notifications.
 
-This avoids continuously receiving writable events for sockets that have no pending output.
+## Build and run
 
-## Build
+Requirements are Linux, GCC (or a compatible C compiler), GNU Make, and Python 3 for the test programs.
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Og -g server.c -o server
+make
+make run
 ```
 
-## Run
-
-```bash
-./server
-```
-
-The server listens on TCP port `8080`.
+The server listens on all interfaces on TCP port `8080`:
 
 ```text
 listening on 8080
 ```
 
-## Periodic Connection Monitoring
+To remove the compiled binary:
 
-The server creates a non-blocking `timerfd` and registers it with the same
-`epoll` instance as the listener and client sockets. The timer expires every
-10 seconds, allowing periodic work to remain inside the event loop without a
-separate thread or signal handler.
-
-On each timer event, the server reports the current number of active client
-connections and the number of timer expirations consumed by `read()`:
-
-```text
-active clients: 3
-timer fired: 1 time(s)
+```bash
+make clean
 ```
 
-The expiration count is normally `1`. It can be greater when the event loop
-could not process the timer immediately, because `timerfd` accumulates
-expirations until they are read.
+The equivalent direct compilation command is:
 
-## Manual Test
+```bash
+gcc -Wall -Wextra -Wpedantic -Og -g server.c -o server
+```
 
-Connect with `nc` from another terminal.
+`SO_REUSEADDR` is enabled so the server can usually be restarted without waiting for old TCP state to expire.
+
+## Shutdown
+
+Stop the server with `Ctrl-C`, `SIGTERM`, or `SIGQUIT`:
+
+```bash
+kill -TERM "$(pidof server)"
+```
+
+These signals are blocked from their default delivery path and read from a non-blocking `signalfd`. Because that descriptor is registered with `epoll`, signal handling stays synchronous with the rest of the event loop. On receipt, the server closes its listener, timer, signal, and epoll descriptors before exiting.
+
+This is a controlled process shutdown, but it does not drain outstanding client responses before exit.
+
+## Testing
+
+Start the server in one terminal before running these commands in another.
+
+### Manual echo test
 
 ```bash
 nc 127.0.0.1 8080
 ```
 
-Example:
+Each newline-terminated message is echoed exactly once.
 
-```text
-hello
-hello
-```
-
-Multiple terminals can connect at the same time.
-
-## Concurrent Connection Test
-
-A simple shell test can create many clients concurrently.
-
-Example:
+### Concurrent connections
 
 ```bash
-for i in $(seq 1 100); do
-    {
-        printf "client-%d\n" "$i"
-        sleep 5
-    } | nc 127.0.0.1 8080 &
-done
-
-wait
+./clients-connect.sh
 ```
 
-This was used to verify that the server could accept and process around 100 concurrent connections.
+This opens 100 concurrent `nc` clients and keeps them connected for varying lengths of time.
 
-## Python Load Test
+### Request/response load test
 
-The repository also contains Python tests based on `asyncio`.
-
-A typical load test creates many clients and repeatedly sends messages to the echo server.
-
-For example:
-
-```text
-100 clients
-x
-1000 messages
-=
-100,000 echo requests
+```bash
+python3 load_test.py
 ```
 
-This makes it easier to test:
+The default configuration creates 100 clients, sends 1000 line-based requests per client, waits for every echo, and reports elapsed time and messages per second.
 
-* concurrent connections
-* repeated reads and writes
-* event loop behavior
-* disconnect handling
+### Slow-reader test
 
-## Slow Reader Test
-
-A slow-reader test is included to intentionally create TCP backpressure.
-
-The client sends many messages to the server but intentionally delays reading the echoed responses.
-
-Conceptually:
-
-```text
-client application
-      |
-      | send many messages
-      v
-server
-      |
-      | echo responses
-      v
-client kernel receive buffer
-      |
-      | application does not read
-      v
-Recv-Q grows
-      |
-      v
-TCP flow control
-      |
-      v
-server-side writes become harder
-      |
-      v
-write() -> EAGAIN
-      |
-      v
-wait for EPOLLOUT
+```bash
+python3 slow_reader_test.py
 ```
 
-This test is useful because small echo requests often complete immediately and do not exercise the `EPOLLOUT` path.
+One hundred clients send many messages without reading the responses, wait for five seconds, and then close. This makes server-side writes more likely to reach `EAGAIN`.
 
-## Observing TCP State with ss
+### No-reader test
 
-Socket state can be inspected with:
+```bash
+python3 no_reader_test.py
+```
+
+One client attempts to send 100,000 messages and never reads the echoed data. This is the strongest backpressure test in the repository: it can block in `sendall()` once TCP flow control reaches the client. Its final sleep keeps the connection available for inspection.
+
+The workload values in the Python files can be reduced for shorter runs.
+
+## Observing the server
+
+Inspect TCP queues with:
 
 ```bash
 ss -tan
-```
-
-Typical output columns are:
-
-```text
-State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port
-```
-
-### Recv-Q
-
-`Recv-Q` represents data that has already been received by the kernel but has not yet been consumed by the application with `read()`.
-
-During the slow-reader test, the client-side `Recv-Q` can become large because the client intentionally does not read the echo responses.
-
-### Send-Q
-
-`Send-Q` represents data written by the application that has not yet been fully transmitted or acknowledged through the TCP stack.
-
-For more detailed TCP information:
-
-```bash
 ss -tin
 ```
 
-## Observing System Calls with strace
+- `Recv-Q` is data accepted by the kernel but not yet read by the application.
+- `Send-Q` is data written by the application but not yet fully delivered through the TCP stack.
 
-The event loop can be observed directly with `strace`.
+Trace the core system calls with:
 
 ```bash
-strace -p $(pidof server) \
-  -e trace=epoll_wait,accept4,read,write
+strace -p "$(pidof server)" \
+  -e trace=epoll_wait,epoll_ctl,accept4,read,write
 ```
 
-A typical client message produces something like:
+During a backpressure test, useful server log lines include:
 
 ```text
-epoll_wait(...)
-read(...)
-write(...)
-read(...) = -1 EAGAIN
-epoll_wait(...)
+write EAGAIN fd=7 pos=600 len=1000
+EPOLLOUT fd=7
 ```
 
-This corresponds directly to the server logic:
+The first line shows a saved partial-write position. The later `EPOLLOUT` event allows the server to continue from that position.
 
-```text
-wait for readiness
-        |
-read available data
-        |
-write response
-        |
-read again
-        |
-EAGAIN -> no more data currently available
-        |
-return to epoll_wait
-```
-
-New client connections can be observed as:
-
-```text
-epoll_wait(...)
-accept4(...)
-accept4(...) = -1 EAGAIN
-epoll_wait(...)
-```
-
-The second `accept4()` is intentional.
-
-The server accepts connections until the non-blocking listener returns `EAGAIN`, meaning that the accept queue is currently empty.
-
-## EINTR
-
-System calls can be interrupted by signals.
-
-For example, `strace` may show:
-
-```text
-epoll_wait(...) = -1 EINTR
-```
-
-The server handles this by retrying the operation rather than treating it as a fatal error.
-
-## File Descriptor Reuse
-
-File descriptor numbers are not permanent client identifiers.
-
-For example:
-
-```text
-client A -> fd 5
-
-close(fd 5)
-
-client B -> fd 5
-```
-
-Linux commonly reuses low-numbered file descriptors after they are closed.
-
-For this reason, the server stores a pointer to a client structure in:
-
-```c
-epoll_event.data.ptr
-```
-
-rather than treating the file descriptor number as a persistent client identity.
-
-## TCP Is a Byte Stream
-
-An important result from the load tests was observing that TCP does not preserve application message boundaries.
-
-A sender may write:
-
-```text
-message-1\n
-message-2\n
-message-3\n
-```
-
-but the receiver may observe:
-
-```text
-read #1 -> "message-1\nmessage"
-read #2 -> "-2\nmess"
-read #3 -> "age-3\n"
-```
-
-A single `write()` does not necessarily correspond to a single `read()`.
-
-This means that production protocols need explicit framing, such as:
-
-* newline-delimited messages
-* fixed-length messages
-* length-prefixed messages
-
-A future version of this project may add a per-client input buffer and message framing.
-
-## Error Handling
-
-The server handles several important socket conditions.
+## Error handling
 
 ```text
 EINTR
-    system call interrupted by a signal
-    -> retry
+    retry the interrupted operation
 
 EAGAIN / EWOULDBLOCK
-    non-blocking operation cannot proceed now
-    -> return to the event loop
+    preserve state and return to epoll_wait()
 
-EPIPE
-    write attempted after peer disconnect
-    -> close only that client
+EPIPE or ECONNRESET
+    close only the affected client
 
 read() == 0
-    peer performed an orderly shutdown
-    -> close the client
+    peer performed an orderly shutdown; close that client
 ```
 
-`SIGPIPE` is ignored so that writing to a disconnected client does not terminate the entire server process.
+`SIGPIPE` is ignored so that a failed socket write becomes an `EPIPE` error instead of terminating the whole process. A client-specific failure decrements the active-client count and leaves the server running.
 
-Instead, the write failure can be handled as `EPIPE`.
+## Learning topics
 
-## Testing and Debugging Tools
+- Level-triggered `epoll`
+- Non-blocking sockets and readiness-driven I/O
+- `accept4()`, `timerfd`, and `signalfd`
+- TCP byte-stream framing
+- Partial reads and writes
+- `EAGAIN`, `EINTR`, `EPIPE`, and connection reset handling
+- TCP send/receive queues and flow control
+- Per-connection state and file descriptor reuse
+- Runtime inspection with `ss` and `strace`
 
-The project uses Linux tools to observe actual runtime behavior rather than relying only on source-level reasoning.
+## Development notes
 
-Useful commands include:
+The server was developed incrementally as a Linux systems programming exercise, with behavior checked through load tests, `ss`, and `strace`. AI coding assistants, including Codex and ChatGPT, were used for code review, debugging discussions, edge-case analysis, test design, and documentation support; the implementation was not generated as a one-shot project.
 
-```bash
-ss -tan
-ss -tin
-strace -p <pid>
-ls /proc/<pid>/fd
-```
+## Current limitations and future work
 
-These tools make it possible to connect the C implementation with actual kernel and TCP behavior.
+- Explicit handling for `EPOLLERR`, `EPOLLHUP`, and `EPOLLRDHUP`
+- Draining active clients during graceful shutdown
+- Configurable address, port, buffer sizes, and logging
+- Automated integration tests
+- Connection and throughput statistics
+- Comparisons with `select`, `poll`, and edge-triggered `EPOLLET`
+- Larger-scale latency and throughput measurements
 
-## Development Process
-
-The core server implementation was written hands-on as part of my Linux systems programming study.
-
-I implemented and iteratively refined the main networking logic myself, including:
-
-* socket setup
-* non-blocking I/O
-* `epoll` registration and event handling
-* `EPOLLIN` / `EPOLLOUT`
-* client state management
-* partial write handling
-* `EAGAIN` / `EINTR`
-* disconnect and error handling
-* load testing and runtime observation
-
-AI coding tools, including Codex / ChatGPT, were used as development assistants for:
-
-* code review
-* debugging support
-* discussing Linux API behavior
-* identifying edge cases
-* suggesting refactoring opportunities
-* reviewing error handling
-* explaining `epoll`, TCP, and socket behavior
-* helping design test scenarios
-* assisting with documentation and README authoring
-
-The implementation was not generated as a one-shot project. The server was developed incrementally while testing and inspecting its behavior with tools such as `ss` and `strace`.
-
-## What I Learned
-
-Through this project, I practiced and observed:
-
-* Linux socket programming in C
-* I/O multiplexing
-* differences between `select`, `poll`, and `epoll`
-* event-driven programming
-* non-blocking I/O
-* `EPOLLIN`
-* `EPOLLOUT`
-* partial writes
-* `EAGAIN`
-* `EINTR`
-* `SIGPIPE`
-* `EPIPE`
-* TCP kernel buffers
-* `Recv-Q`
-* `Send-Q`
-* TCP backpressure
-* file descriptor reuse
-* TCP stream semantics
-* load testing
-* system call tracing
-* runtime socket inspection
-
-## Future Work
-
-Possible next steps include:
-
-* per-client input buffers
-* proper newline-based message framing
-* `EPOLLERR`
-* `EPOLLHUP`
-* `EPOLLRDHUP`
-* graceful shutdown
-* connection statistics
-* benchmark result recording
-* comparison with `select`
-* comparison with `poll`
-* Edge Triggered mode with `EPOLLET`
-* automated integration tests
-* larger-scale concurrent connection testing
-* latency and throughput measurement
-
-## Environment
-
-Developed and tested on Linux.
-
-Main Linux APIs used:
-
-```text
-socket
-setsockopt
-bind
-listen
-accept4
-read
-write
-epoll_create1
-epoll_ctl
-epoll_wait
-close
-```
-
-## Purpose
-
-This repository is primarily a learning project for Linux systems programming, TCP networking, and event-driven server design.
-
-The emphasis is not only on making the echo server work, but also on understanding and observing what happens inside Linux when multiple TCP clients are handled concurrently.
+This repository is intentionally small and direct: its purpose is to make Linux event-driven networking behavior easy to read, run, and observe.
