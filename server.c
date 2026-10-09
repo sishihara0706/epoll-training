@@ -66,6 +66,86 @@ struct st_timer_info {
 	
 };
 
+static void dump_client(const struct st_client *client)
+{
+	if(client == NULL)
+		return;
+
+	fprintf(stderr, "\n================ CLIENT DUMP ==================\n");
+	fprintf(stderr, "fd						:	%d\n", client->base.fd);
+	fprintf(stderr, "in_len					:	%zu / %d\n",
+		client->in_len, BUFF_SIZE);
+	fprintf(stderr, "queued_bytes			:	%zu\n", client->queued_bytes);
+	fprintf(stderr, "queued_messages		:	%zu\n", client->queued_messages);
+	fprintf(stderr, "read_paused			:	%s\n",
+		client->read_paused ? "YES" : "NO");
+
+	fprintf(stderr, "\n[OUTPUT QUEUE]\n");
+
+	const struct st_outmsg *msg = client->head;
+	size_t index = 0;
+	size_t remaining_total = 0;
+
+	while (msg != NULL && index < QUEUE_MAX_MESSAGES + 1)
+	{
+		size_t remaining = 0;
+
+		if(msg->pos <= msg->len && msg->len <= BUFF_SIZE)
+			remaining = msg->len - msg->pos;
+		else
+			fprintf(stderr, " WARNING invalid pos/len\n");
+		
+		fprintf(stderr,
+				"\n [MESSAGE %zu] \n"
+				"   address     : %p\n"
+				"   len         : %zu\n"
+				"   pos         : %zu\n"
+				"   remaining   : %zu\n"
+				"   next        : %p%s\n",
+				index,
+				(void *)msg,	
+				msg->len,
+				msg->pos,
+				remaining,
+				(void *)msg->next,
+				msg == client->tail ? " <-- TAIL" : "");
+
+		fprintf(stderr, "	data	: %.*s\n",
+			(int)msg->len,
+			msg->buf
+		);
+
+		fprintf(stderr, "	unset	: %.*s\n",
+			(int)remaining,
+			msg->buf + msg->pos
+		);
+	
+		remaining_total += remaining;
+		msg = msg->next;
+		index++;
+	}
+
+	if(msg != NULL)
+		fprintf(stderr, " WARNING: traversal limit reached\n");
+
+	fprintf(stderr, "\n[CHECK]\n");
+	fprintf(stderr, "counted_messages	: %zu\n", index);
+	fprintf(stderr, "counted_bytes		: %zu\n", remaining_total);
+
+	if(msg == NULL &&
+		index == client->queued_messages &&
+		remaining_total == client->queued_bytes)
+	{
+		fprintf(stderr, "queued counters	: OK\n");
+	}
+	else
+	{
+		fprintf(stderr, "queue counters		: MISMATCH\n");
+	}
+
+	fprintf(stderr, "=========================================\n\n");
+}
+
 static void free_output_queue(struct st_client *client)
 {
 	struct st_outmsg *msg = client->head;
@@ -94,11 +174,12 @@ static int flush_output(struct st_client *client)
 			if(nw > 0)
 			{
 				printf(
-						"write fd=%d nw=%zd pos=%zu/%zu func=%s\n",
+						"write fd=%d nw=%zd pos=%zu/%zu queued_bytes=%zu func=%s\n",
 						client->base.fd,
 						nw,
 						msg->pos + nw,
 						msg->len,
+						client->queued_bytes,
 						__func__
 					  );
 
@@ -119,10 +200,12 @@ static int flush_output(struct st_client *client)
 			if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
 			{
 				printf(
-						"write EAGAIN fd=%d pos=%zu len=%zu\n",
+						"write EAGAIN fd=%d pos=%zu len=%zu queued_bytes=%zu func=%s\n",
 						client->base.fd,
 						msg->pos,
-						msg->len
+						msg->len,
+						client->queued_bytes,
+						__func__
 					  );
 				return 0;
 			}
@@ -267,17 +350,18 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 		{
 			return ret;
 		}
-		if(client->head != NULL)
-		{
-			goto update_events;
-		}
 	}
 
-	if(events & EPOLLIN)
+	if((events & EPOLLIN) && !client->read_paused)
 	{
 		printf("EPOLLIN fd=%d\n", client->base.fd);
 		for(;;)
 		{
+			if(client->queued_bytes >= QUEUE_HIGH_WATER) 
+			{
+				break;
+			}
+
 			if(client->in_len == BUFF_SIZE)
 			{
 				fprintf(stderr, "input buffer full fd=%d\n", client->base.fd);
@@ -296,12 +380,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 				int ret = process_and_flush(client);
 				if(ret != 0)
 				{
-					break;
-				}
-
-				if(client->head != NULL)
-				{
-					break;
+					return ret;
 				}
 
 				continue;
@@ -329,8 +408,9 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 		}
 	}
 
-update_events:
-	wanted = 0;
+	wanted = EPOLLRDHUP;
+
+	int old_paused = client->read_paused;
 
 	if (!client->read_paused && client->queued_bytes >= QUEUE_HIGH_WATER)
 	{
@@ -340,6 +420,11 @@ update_events:
 	if(client->read_paused && client->queued_bytes <= QUEUE_LOW_WATER)
 	{
 		client->read_paused = 0;
+	}
+
+	if(old_paused != client->read_paused)
+	{
+		dump_client(client);
 	}
 
 	if(!client->read_paused)
