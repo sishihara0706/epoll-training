@@ -91,10 +91,23 @@ static void dump_client(const struct st_client *client)
 		size_t remaining = 0;
 
 		if(msg->pos <= msg->len && msg->len <= BUFF_SIZE)
+		{
 			remaining = msg->len - msg->pos;
+			fprintf(stderr, "	data	: %.*s\n",
+					(int)msg->len,
+					msg->buf
+				   );
+
+			fprintf(stderr, "	unsent	: %.*s\n",
+					(int)remaining,
+					msg->buf + msg->pos
+				   );
+		}
 		else
+		{
 			fprintf(stderr, " WARNING invalid pos/len\n");
-		
+		}
+
 		fprintf(stderr,
 				"\n [MESSAGE %zu] \n"
 				"   address     : %p\n"
@@ -110,15 +123,6 @@ static void dump_client(const struct st_client *client)
 				(void *)msg->next,
 				msg == client->tail ? " <-- TAIL" : "");
 
-		fprintf(stderr, "	data	: %.*s\n",
-			(int)msg->len,
-			msg->buf
-		);
-
-		fprintf(stderr, "	unset	: %.*s\n",
-			(int)remaining,
-			msg->buf + msg->pos
-		);
 	
 		remaining_total += remaining;
 		msg = msg->next;
@@ -158,6 +162,8 @@ static void free_output_queue(struct st_client *client)
 
 	client->head = NULL;
 	client->tail = NULL;
+	client->queued_bytes = 0;
+	client->queued_messages = 0;
 }
 
 static int flush_output(struct st_client *client)
@@ -293,13 +299,24 @@ int process_input(struct st_client *client)
 	char *p;
 	while((p = memchr(client->in_buf, '\n', client->in_len)) != NULL)
 	{
+		size_t line_len = (size_t)(p - client->in_buf) + 1;
+
+		if(client->queued_messages >= QUEUE_MAX_MESSAGES ||
+			client->queued_bytes > QUEUE_MAX_BYTES ||
+			line_len > QUEUE_MAX_BYTES - client->queued_bytes)
+		{
+			fprintf(stderr,
+				"output queue limit exceeded fd=%d\n",
+				client->base.fd);
+			return -1;
+		}
+
 		struct st_outmsg *msg = calloc(1, sizeof(*msg));
 		if(msg == NULL)
 		{
 			return -1;
 		}
 
-		size_t line_len = (size_t)(p - client->in_buf) + 1;
 		memcpy(msg->buf, client->in_buf, line_len);
 
 		msg->len = line_len;
