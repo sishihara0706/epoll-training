@@ -10,10 +10,10 @@ Linux の `epoll`、ノンブロッキング I/O、TCP ストリーム処理、�
 
 - level-triggered な単一の `epoll` ループによる複数クライアント処理
 - `socket()` と `accept4()` で作成する non-blocking／close-on-exec ソケット
-- `epoll_event.data.ptr` を使ったクライアントごとの入出力状態管理
+- `epoll_event.data.ptr` を使ったクライアントごとの入力バッファと FIFO 出力キューの管理
 - TCP の分割・結合された read に対応する改行ベースのメッセージ分割
-- partial write と `EPOLLOUT` への対応
-- Echo の未送信データがある間の read-side バックプレッシャー
+- 順序を維持した partial-write-safe な `EPOLLOUT` 処理
+- 出力キューの byte 数に基づく high/low-water read throttling
 - `timerfd` による接続中クライアント数の定期表示
 - `signalfd` によるイベントループ内でのシグナル処理
 - `EPIPE` や connection reset を含むクライアント単位のエラー処理
@@ -23,9 +23,11 @@ Linux の `epoll`、ノンブロッキング I/O、TCP ストリーム処理、�
 
 元の README に反映されていなかった最近の変更は次のとおりです。
 
-- 入力をクライアントごとに蓄積し、完全な1行単位で Echo するようになりました。TCP の read 境界をメッセージ境界とはみなしません。
-- 入力バッファ内に完全な行が複数ある場合も、順番に処理します。
-- レスポンスをすべて送信できなかった場合は、そのクライアントを `EPOLLOUT` だけで監視します。未送信データの送信後に read を再開することで、アプリケーションのバッファ使用量を制限し、送信元までバックプレッシャーを伝えます。
+- 完全な入力行ごとにクライアント固有の linked-list 出力キューへコピーします。遅いクライアントに複数のレスポンスが滞留しても、メッセージの順序を維持できます。
+- キュー内の byte 数とメッセージ数を追跡します。partial write が成功するたびに byte 数を減らし、送信を完了したキューノードはすぐに解放します。
+- read-side throttling に hysteresis を導入しました。キュー内の未送信データが 64 KiB に達すると `EPOLLIN` を停止し、32 KiB 以下になると再開します。high-water mark 未満では、`EPOLLIN` と `EPOLLOUT` を同時に監視する場合があります。
+- クライアントの切断またはエラー時に、残っている出力キューを解放します。
+- 入力をクライアントごとに蓄積し、TCP の read 境界をメッセージ境界とみなさず、改行で区切られた完全なメッセージへ分割します。
 - `SIGINT`、`SIGTERM`、`SIGQUIT` を block して `signalfd` から読み取り、終了処理も `epoll` イベントループ内で行うようになりました。
 - build、run、clean の標準ターゲットを持つ `Makefile` を追加しました。
 - 継続的なバックプレッシャーを意図的に起こす `no_reader_test.py` を追加しました。
@@ -51,11 +53,11 @@ epoll_wait()
    |
    +-- client / EPOLLIN
    |     client の入力バッファへ read
-   |     改行で区切られた完全なメッセージを取り出す
-   |     socket が許す範囲で Echo を write
+   |     改行で区切られた完全なメッセージをすべて enqueue
+   |     socket が許す範囲で出力キューを flush
    |
    +-- client / EPOLLOUT
-   |     partial write の続きから再開
+   |     出力キューの flush を再開
    |
    +-- timerfd / EPOLLIN
    |     10秒ごとに接続中の client 数を表示
@@ -80,44 +82,59 @@ beta\n
 そのため、各クライアントは入力バッファを持ちます。
 
 ```c
-char in_buf[BUFF_SIZE + 1];
+char in_buf[BUFF_SIZE];
 size_t in_len;
 ```
 
-サーバーは不完全な入力を保持し、`\n` を探して完全な1行だけを出力バッファへ移します。残ったデータは次のメッセージとして入力バッファに保持します。改行がないまま 4096 byte の入力バッファを使い切った場合はエラーとし、そのクライアントを切断します。
+サーバーは不完全な入力を保持して `\n` を探します。完全な各行を新しい FIFO 出力キューのノードへコピーし、残った不完全なデータは次の read のために入力バッファへ保持します。改行がないまま 4096 byte の入力バッファを使い切った場合はエラーとし、そのクライアントを切断します。
 
 ## Partial write とバックプレッシャー
 
-non-blocking な `write()` は、レスポンスの一部だけを送信したり、`EAGAIN` を返したりします。クライアント構造体は event loop をまたいで送信位置を保持します。
+non-blocking な `write()` は、レスポンスの一部だけを送信したり、`EAGAIN` を返したりします。キュー内の各メッセージがそれぞれの送信位置を保持し、クライアントはキュー全体とその合計量を管理します。
 
 ```c
-char out_buf[BUFF_SIZE + 2];
-size_t out_len;
-size_t out_pos;
+struct st_outmsg {
+    char buf[BUFF_SIZE];
+    size_t len;
+    size_t pos;
+    struct st_outmsg *next;
+};
+
+struct st_outmsg *head;
+struct st_outmsg *tail;
+size_t queued_bytes;
+size_t queued_messages;
+int read_paused;
 ```
 
-例えば `out_len = 1000`、`out_pos = 600` なら、残りは 400 byte です。
+例えば、キュー先頭のメッセージが `len = 1000`、`pos = 600` なら、そのメッセージの残りは 400 byte です。write が成功するたびに `queued_bytes` を減らし、送信完了したノードをキュー先頭から取り除いて解放します。完全な行が複数待機していても、レスポンスの FIFO 順序を維持できます。
 
 ```text
-完全な1行を取得
+完全な行を取得
         |
         v
-可能な範囲まで write
+メッセージを FIFO キューへ追加
         |
-        +-- 送信完了 ------------> EPOLLIN を監視
+        v
+キュー先頭から可能な範囲まで flush
         |
-        +-- EAGAIN / partial write
-                |
-                v
-          out_pos を保持
-          EPOLLOUT のみ監視
-                |
-                v
-          残りを送信
-          EPOLLIN を再開
+        +-- キューが空 ----------> EPOLLIN
+        |
+        +-- read が有効かつ
+        |   64 KiB 未満 ----------> EPOLLIN | EPOLLOUT
+        |
+        +-- 64 KiB に到達 --------> EPOLLIN を停止
+                                         |
+                                         v
+                                  EPOLLOUT で flush
+                                         |
+                              未送信データが 32 KiB 以下
+                                         |
+                                         v
+                                   EPOLLIN を再開
 ```
 
-`EPOLLIN` を一時的に無効にするのは意図した動作です。レスポンスを届けられないクライアントからリクエストだけを読み続けることを防ぎ、kernel の受信バッファと TCP flow control を通して送信元へ圧力を伝えます。未送信データがなくなれば `EPOLLOUT` もすぐ解除するため、不要な writable 通知は発生し続けません。
+high watermark と low watermark を分ける hysteresis によって、単一の閾値付近で `EPOLLIN` が頻繁に切り替わることを防ぎます。read の停止中は kernel の受信バッファと TCP flow control を通して送信元へ圧力を伝えます。キューが空になれば `EPOLLOUT` もすぐ解除するため、不要な writable 通知は発生し続けません。
 
 ## ビルドと実行
 
@@ -271,6 +288,7 @@ read() == 0
 ## 現在の制約と今後の候補
 
 - `EPOLLERR`、`EPOLLHUP`、`EPOLLRDHUP` の明示的な処理
+- `QUEUE_MAX_BYTES` と `QUEUE_MAX_MESSAGES` による hard limit の適用。定数は定義済みですが、現在のキュー処理が行うのは high/low-water read throttling だけです
 - graceful shutdown 時に接続中クライアントを drain
 - address、port、buffer size、logging の設定可能化
 - 自動 integration test

@@ -12,10 +12,15 @@
 #include<sys/timerfd.h>
 #include<sys/signalfd.h>
 
-#define PORT 8080
-#define EVENT_NUM 1000
-#define BUFF_SIZE 4096
-#define LISTEN_NUM 128
+#define PORT				8080
+#define EVENT_NUM			1000
+#define BUFF_SIZE			4096
+#define LISTEN_NUM			128
+
+#define QUEUE_HIGH_WATER	(64 * 1024)
+#define QUEUE_LOW_WATER 	(32 * 1024)
+#define QUEUE_MAX_BYTES		(256 * 1024)
+#define QUEUE_MAX_MESSAGES	1024
 
 static int active_clients;
 
@@ -33,15 +38,26 @@ struct fd_info
 	int fd;
 };
 
+struct st_outmsg {
+	char buf[BUFF_SIZE];
+
+	size_t len;
+	size_t pos;
+	struct st_outmsg *next;
+};
+
 struct st_client {
 	struct fd_info base;
 
-	char in_buf[BUFF_SIZE+1];
+	char in_buf[BUFF_SIZE];
 	size_t in_len;
 
-	char out_buf[BUFF_SIZE+2];
-	size_t out_len; // 全体で何バイト送る予定か
-	size_t out_pos; // 何バイト目まで送信済みか
+	struct st_outmsg *head;
+	struct st_outmsg *tail;
+
+	size_t queued_bytes;
+	size_t queued_messages;
+	int read_paused;
 };
 
 struct st_timer_info {
@@ -50,49 +66,79 @@ struct st_timer_info {
 	
 };
 
+static void free_output_queue(struct st_client *client)
+{
+	struct st_outmsg *msg = client->head;
+	while(msg != NULL)
+	{
+		struct st_outmsg *next = msg->next;
+		free(msg);
+		msg = next;
+	}
+
+	client->head = NULL;
+	client->tail = NULL;
+}
+
 static int flush_output(struct st_client *client)
 {
 	ssize_t nw;
 
-	while(client->out_pos < client->out_len)
+	while(client->head != NULL)
 	{
-		nw = write(client->base.fd, client->out_buf + client->out_pos, client->out_len - client->out_pos);
-		if(nw > 0)
-		{
-			printf(
-					"write fd=%d nw=%zd pos=%zu/%zu func=%s\n",
-					client->base.fd,
-					nw,
-					client->out_pos + nw,
-					client->out_len,
-					__func__
-				  );
+		struct st_outmsg *msg = client->head;
 
-			client->out_pos += nw;
-			continue;
-		}
-		if (nw == -1 && errno == EINTR)
+		while(msg->pos < msg->len)
 		{
-			continue;
+			nw = write(client->base.fd, msg->buf + msg->pos, msg->len - msg->pos);
+			if(nw > 0)
+			{
+				printf(
+						"write fd=%d nw=%zd pos=%zu/%zu func=%s\n",
+						client->base.fd,
+						nw,
+						msg->pos + nw,
+						msg->len,
+						__func__
+					  );
+
+				msg->pos += nw;
+				client->queued_bytes -= nw;
+				continue;
+			}
+			if (nw == -1 && errno == EINTR)
+			{
+				continue;
+			}
+
+			if (nw == -1 && errno == EPIPE)//閉じているソケットに書き込もうとした
+			{
+				return 1; // client切断扱い
+			}
+
+			if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			{
+				printf(
+						"write EAGAIN fd=%d pos=%zu len=%zu\n",
+						client->base.fd,
+						msg->pos,
+						msg->len
+					  );
+				return 0;
+			}
+			perror("write");
+			return -1;
 		}
+
+		client->head = msg->next;
+		client->queued_messages--;
+
+		free(msg);
 		
-		if (nw == -1 && errno == EPIPE)//閉じているソケットに書き込もうとした
+		if(client->head == NULL)
 		{
-			return 1; // client切断扱い
+			client->tail = NULL;
 		}
-
-		if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-		{ 
-			printf(
-					"write EAGAIN fd=%d pos=%zu len=%zu\n",
-					client->base.fd,
-					client->out_pos,
-					client->out_len
-				  );
-			break;
-		}
-		perror("write");
-		return -1;
 	}
 	return 0;
 }
@@ -161,58 +207,51 @@ static int accept_client(int epoll_fd, int sfd)
 
 int process_input(struct st_client *client)
 {
-	if(client->out_len != 0)
+	char *p;
+	while((p = memchr(client->in_buf, '\n', client->in_len)) != NULL)
 	{
-		return 0;
+		struct st_outmsg *msg = calloc(1, sizeof(*msg));
+		if(msg == NULL)
+		{
+			return -1;
+		}
+
+		size_t line_len = (size_t)(p - client->in_buf) + 1;
+		memcpy(msg->buf, client->in_buf, line_len);
+
+		msg->len = line_len;
+		msg->pos = 0;
+
+		size_t remain = client->in_len - line_len;
+		memmove(client->in_buf, p + 1, remain);
+		client->in_len = remain;
+
+		if (client->head == NULL || client->tail == NULL)
+		{
+			client->head = msg;
+			client->tail = msg;
+		}
+		else
+		{
+			client->tail->next = msg;
+			client->tail = msg;
+		}
+
+		client->queued_messages++;
+		client->queued_bytes += msg->len;
 	}
-
-	char *p = memchr(client->in_buf, '\n', client->in_len);
-	if( p == NULL )
-	{
-		return 0;
-	}
-
-	size_t line_len = (size_t)(p - client->in_buf) + 1;
-	memcpy(client->out_buf, client->in_buf, line_len);
-
-	client->out_len = line_len;
-	client->out_pos = 0;
-
-	size_t remain = client->in_len - line_len;
-	memmove(client->in_buf, p + 1, remain);
-	client->in_len = remain;
-	
-	return 1;	
+	return 0;
 }
 
 static int process_and_flush(struct st_client *client)
 {
-	for(;;)
+	int ret = process_input(client);
+	if(ret < 0)
 	{
-		if(client->out_len == 0)
-		{
-			if(!process_input(client))
-			{
-				break;
-			}
-		}
-
-		int ret = flush_output(client);
-		if(ret != 0)
-		{
-			return ret;
-		}
-
-		if(client->out_pos < client->out_len)
-		{
-			// まだout_bufの中をすべて送りきれていない
-			break;
-		}
-
-		client->out_pos = 0;
-		client->out_len = 0;
+		return ret;
 	}
-	return 0;	
+
+	return flush_output(client);
 }
 
 static int handle_client(int epoll_fd, struct st_client *client, uint32_t events)
@@ -228,7 +267,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 		{
 			return ret;
 		}
-		if(client->out_pos < client->out_len)
+		if(client->head != NULL)
 		{
 			goto update_events;
 		}
@@ -244,6 +283,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 				fprintf(stderr, "input buffer full fd=%d\n", client->base.fd);
 				return -1;
 			}
+
 			nr = read(
 				client->base.fd, 
 				client->in_buf + client->in_len,
@@ -259,7 +299,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 					break;
 				}
 
-				if(client->out_pos < client->out_len)
+				if(client->head != NULL)
 				{
 					break;
 				}
@@ -290,14 +330,26 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 	}
 
 update_events:
+	wanted = 0;
 
-	if(client->out_pos < client->out_len)
+	if (!client->read_paused && client->queued_bytes >= QUEUE_HIGH_WATER)
 	{
-		wanted = EPOLLOUT;
+		client->read_paused = 1;
 	}
-	else
+
+	if(client->read_paused && client->queued_bytes <= QUEUE_LOW_WATER)
 	{
-		wanted = EPOLLIN;
+		client->read_paused = 0;
+	}
+
+	if(!client->read_paused)
+	{
+		wanted |= EPOLLIN;
+	}
+
+	if(client->head != NULL)
+	{
+		wanted |= EPOLLOUT;
 	}
 
 	struct epoll_event ev = {
@@ -593,6 +645,7 @@ int main (void)
 					fprintf(stderr, "get -1 from handle_client,\nsocket close fd=%d\n", client->base.fd);
 					close(client->base.fd);
 					active_clients--;
+					free_output_queue(client);
 					free(client);
 					continue;
 				}
@@ -600,6 +653,7 @@ int main (void)
 				{
 					close(client->base.fd);
 					active_clients--;
+					free_output_queue(client);
 					free(client);
 					continue;
 				}
