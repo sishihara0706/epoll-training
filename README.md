@@ -10,10 +10,10 @@ The program is a newline-delimited TCP echo server. A single `epoll` event loop 
 
 - Multiple concurrent clients on one level-triggered `epoll` loop
 - Non-blocking, close-on-exec sockets created with `socket()` and `accept4()`
-- Per-client input and output buffers stored through `epoll_event.data.ptr`
+- Per-client input buffers and FIFO output queues stored through `epoll_event.data.ptr`
 - Newline-based message framing across partial and combined TCP reads
-- Partial-write handling with `EPOLLOUT`
-- Read-side backpressure while an echo response is still pending
+- Ordered, partial-write-safe output handling with `EPOLLOUT`
+- High/low-water read throttling based on queued output bytes
 - Periodic active-client reporting with `timerfd`
 - Signal handling inside the event loop with `signalfd`
 - Isolated client error handling, including `EPIPE` and connection resets
@@ -23,9 +23,11 @@ The program is a newline-delimited TCP echo server. A single `epoll` event loop 
 
 The latest changes add behavior that was not covered by the original README:
 
-- Input is accumulated per client and echoed one complete line at a time. TCP read boundaries are no longer treated as message boundaries.
-- Multiple complete lines already in the input buffer are processed in order.
-- When a response cannot be fully written, the client is monitored for `EPOLLOUT` only. Reading resumes after the pending response has been sent, which bounds application buffering and propagates backpressure to the sender.
+- Each complete input line is copied into a per-client linked-list output queue, so multiple responses can wait for the same slow client without losing message order.
+- The server tracks queued bytes and messages. Bytes are subtracted as partial writes succeed, and completed queue nodes are released immediately.
+- Read-side throttling now uses hysteresis: `EPOLLIN` is paused when queued output reaches 64 KiB and resumed after it falls to 32 KiB or less. Below the high-water mark, `EPOLLIN` and `EPOLLOUT` may be monitored together.
+- A client's remaining output queue is released when that client disconnects or encounters an error.
+- Input is accumulated per client and split into complete newline-delimited messages instead of treating TCP read boundaries as message boundaries.
 - `SIGINT`, `SIGTERM`, and `SIGQUIT` are blocked and consumed through `signalfd`, allowing shutdown to remain part of the `epoll` event loop.
 - A `Makefile` now provides standard build, run, and clean targets.
 - `no_reader_test.py` was added to deliberately exercise sustained backpressure.
@@ -51,11 +53,11 @@ epoll_wait()
    |
    +-- client / EPOLLIN
    |     read into the client's input buffer
-   |     extract complete newline-delimited messages
-   |     write echoes as far as the socket allows
+   |     enqueue every complete newline-delimited message
+   |     flush the output queue as far as the socket allows
    |
    +-- client / EPOLLOUT
-   |     resume a partial write
+   |     resume flushing the output queue
    |
    +-- timerfd / EPOLLIN
    |     report the active-client count every 10 seconds
@@ -80,44 +82,59 @@ may arrive in one read, or either line may be split across several reads.
 Each client therefore owns an input buffer:
 
 ```c
-char in_buf[BUFF_SIZE + 1];
+char in_buf[BUFF_SIZE];
 size_t in_len;
 ```
 
-The server keeps incomplete data, searches for `\n`, and moves one complete line at a time to the output buffer. Remaining bytes stay in the input buffer for the next message. A message that fills the 4096-byte input buffer without a newline is treated as an error and that client is closed.
+The server keeps incomplete data and searches for `\n`. Every complete line is copied into a new FIFO output-queue node; remaining incomplete bytes stay in the input buffer for the next read. A message that fills the 4096-byte input buffer without a newline is treated as an error and that client is closed.
 
 ## Partial writes and backpressure
 
-Non-blocking `write()` may send only part of a response, or fail with `EAGAIN`. The client structure retains the write position across event-loop iterations:
+Non-blocking `write()` may send only part of a response, or fail with `EAGAIN`. Each queued message retains its own write position, while the client tracks the queue and its aggregate size:
 
 ```c
-char out_buf[BUFF_SIZE + 2];
-size_t out_len;
-size_t out_pos;
+struct st_outmsg {
+    char buf[BUFF_SIZE];
+    size_t len;
+    size_t pos;
+    struct st_outmsg *next;
+};
+
+struct st_outmsg *head;
+struct st_outmsg *tail;
+size_t queued_bytes;
+size_t queued_messages;
+int read_paused;
 ```
 
-For example, `out_len = 1000` and `out_pos = 600` means that 400 bytes remain.
+For example, `len = 1000` and `pos = 600` on the head message means that 400 bytes remain in that message. Successful writes reduce `queued_bytes`; fully written nodes are removed from the head and freed. This preserves FIFO response order even when several complete lines are waiting.
 
 ```text
-complete line available
+complete lines available
         |
         v
-write as much as possible
+append messages to FIFO queue
         |
-        +-- response complete --> monitor EPOLLIN
+        v
+flush from the head as much as possible
         |
-        +-- EAGAIN / partial write
-                |
-                v
-          preserve out_pos
-          monitor EPOLLOUT only
-                |
-                v
-          finish the response
-          resume EPOLLIN
+        +-- queue empty ---------> EPOLLIN
+        |
+        +-- reads active and
+        |   queue below 64 KiB --> EPOLLIN | EPOLLOUT
+        |
+        +-- queue reaches 64 KiB -> pause EPOLLIN
+                                      |
+                                      v
+                              flush on EPOLLOUT
+                                      |
+                         queued bytes <= 32 KiB
+                                      |
+                                      v
+                                 resume EPOLLIN
 ```
 
-Temporarily disabling `EPOLLIN` is intentional. It prevents the application from continuing to consume requests from a client whose responses cannot be delivered. The kernel receive buffer then applies TCP flow control naturally. `EPOLLOUT` is disabled again as soon as no output is pending, avoiding continuous writable notifications.
+The separate high and low watermarks provide hysteresis, preventing `EPOLLIN` from rapidly toggling near a single threshold. While reads are paused, the kernel receive buffer applies TCP flow control naturally to the sender. `EPOLLOUT` is disabled as soon as the queue becomes empty, avoiding continuous writable notifications.
 
 ## Build and run
 
@@ -271,6 +288,7 @@ The server was developed incrementally as a Linux systems programming exercise, 
 ## Current limitations and future work
 
 - Explicit handling for `EPOLLERR`, `EPOLLHUP`, and `EPOLLRDHUP`
+- Enforcement of the `QUEUE_MAX_BYTES` and `QUEUE_MAX_MESSAGES` hard limits; the constants exist, but the current queue logic only applies high/low-water read throttling
 - Draining active clients during graceful shutdown
 - Configurable address, port, buffer sizes, and logging
 - Automated integration tests
