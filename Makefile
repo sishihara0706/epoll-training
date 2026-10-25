@@ -4,15 +4,18 @@ CPPFLAGS ?=
 LDFLAGS ?=
 LDLIBS ?=
 
-TARGET := server
-SOURCES := server.c
+TARGET := build/server
+SOURCES := src/server.c
 
 .PHONY: all run clean
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES)
+$(TARGET): $(SOURCES) | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+build:
+	mkdir -p $@
 
 run: $(TARGET)
 	./$(TARGET)

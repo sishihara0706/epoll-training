@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+
+# Debug binaries
+server
+server_asan
+server.log
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor-generated files
+*.swp
+*.swo
+*~
+
+# Ctags
+tags
