@@ -30,14 +30,37 @@ jobs:
           if-no-files-found: error
 
   test:
-  needs: build
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download binary
         uses: actions/download-artifact@v4
         with:
           name: epoll-server
           path: build/
 
-      - name: Prepare 
+      - name: Start server
+        run: |
+          chmod +x build/server
+          ./build/server > server.log 2>&1 &
+          echo $! > server.pid
+
+      - name: Run load test
+        run: |
+          python3 tests/load_test.py
+
+      - name: Step server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill "$(cat server.pid)" 2>/dev/null || true
+          fi
+
+      - name: Print server log
+        if: always()
+        run: cat server.log || true
