@@ -6,24 +6,38 @@ PORT = 8080
 
 CLIENTS = 100
 MESSAGES = 1000
+TIMEOUT = 10
 
 
 async def client_task(client_id):
-    reader, writer = await asyncio.open_connection(HOST, PORT)
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(HOST, PORT),
+        timeout=TIMEOUT,
+    )
 
-    for i in range(MESSAGES):
-        msg = f"client-{client_id}-message-{i}\n"
-        writer.write(msg.encode())
-        await writer.drain()
+    try:
+        for i in range(MESSAGES):
+            msg = f"client-{client_id}-message-{i}\n"
+            expected = msg.encode()
 
-        response = await reader.readline()
+            writer.write(expected)
+            await asyncio.wait_for(
+                writer.drain(), timeout=TIMEOUT
+            )
 
-        if not response:
-            print(f"client {client_id}: disconnected")
-            break
+            response = await asyncio.wait_for(
+                reader.readline(), timeout=TIMEOUT
+            )
 
-    writer.close()
-    await writer.wait_closed()
+            if response != expected:
+                raise AssertionError(
+                    f"client {client_id}, message {i}: "
+                    f"expected={expected!r}, "
+                    f"received={response!r}"
+                )
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
 async def main():
@@ -34,7 +48,6 @@ async def main():
     )
 
     elapsed = time.perf_counter() - start
-
     total = CLIENTS * MESSAGES
 
     print(f"clients  : {CLIENTS}")
@@ -43,4 +56,6 @@ async def main():
     print(f"rate     : {total / elapsed:.0f} msg/sec")
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
+
