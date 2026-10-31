@@ -1,6 +1,10 @@
 CC := gcc
 CFLAGS ?= -Wall -Wextra -Wpedantic -Og -g
-CPPFLAGS ?= -Iinclude -DLOG_LEVEL=LOG_INFO
+
+CPPFLAGS += -Iinclude
+LOG_LEVEL ?= LOG_INFO
+CPPFLAGS += -DLOG_LEVEL=$(LOG_LEVEL)
+
 LDFLAGS ?=
 LDLIBS ?=
 
