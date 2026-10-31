@@ -487,8 +487,8 @@ static int health_check(int tfd)
 		nr = read(tfd, &expirations, sizeof(expirations));
 		if( nr == sizeof(expirations) )
 		{	
-			LOG(LOG_DEBUG, "%s: active clients: %d", __func__, active_clients);
-			LOG(LOG_DEBUG, "%s: timer fired: %llu time(s)", __func__, (unsigned long long)expirations);
+			LOG(LOG_INFO, "%s: active clients: %d", __func__, active_clients);
+			LOG(LOG_INFO, "%s: timer fired: %llu time(s)", __func__, (unsigned long long)expirations);
 			break;
 		}
 		if ( nr < 0 )
@@ -625,8 +625,8 @@ int main (void)
 	}
 
 	struct itimerspec timer = {0};
-	timer.it_value.tv_sec = 60;
-	timer.it_interval.tv_sec = 60;
+	timer.it_value.tv_sec = 10;
+	timer.it_interval.tv_sec = 10;
 	if(timerfd_settime(timer_fd, 0, &timer, NULL) == -1)
 	{
 		perror("timerfd_settime");
