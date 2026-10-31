@@ -161,8 +161,18 @@ jobs:
         if: always()
         run: cat server.log || true
 
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build Docker image
+        run: docker build -t epoll-server:ci .
+
   publish:
-    needs: [build, test]
+    needs: [build, test, sanitize, docker-build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
