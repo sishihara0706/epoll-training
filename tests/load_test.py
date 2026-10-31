@@ -18,7 +18,7 @@ async def client_task(client_id):
     try:
         for i in range(MESSAGES):
             msg = f"client-{client_id}-message-{i}\n"
-            expected = msg.encode() + b"WRONG"
+            expected = msg.encode() 
 
             writer.write(expected)
             await asyncio.wait_for(
