@@ -48,7 +48,27 @@ jobs:
         run: |
           chmod +x build/server
           ./build/server > server.log 2>&1 &
-          echo $! > server.pid
+          SERVER_PID=$!
+          echo "$SERVER_PID" > server.pid
+
+          for i in {1..20}; do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "Server terminated unexpectedly"
+              cat server.log
+              exit 1
+            fi
+
+            if (true > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+              echo "Server is ready"
+              exit 0
+            fi
+
+            sleep 0.5
+          done
+
+          echo "Server readiness timeout"
+          cat server.log
+          exit 1
 
       - name: Run load test
         run: |
