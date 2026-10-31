@@ -12,6 +12,8 @@
 #include<sys/timerfd.h>
 #include<sys/signalfd.h>
 
+#include "log.h"
+
 #define PORT				8080
 #define EVENT_NUM			1000
 #define BUFF_SIZE			4096
@@ -65,6 +67,8 @@ struct st_timer_info {
 	// unique member
 	
 };
+
+#if LOG_LEVEL >= LOG_DEBUG
 
 static void dump_client(const struct st_client *client)
 {
@@ -150,6 +154,8 @@ static void dump_client(const struct st_client *client)
 	fprintf(stderr, "=========================================\n\n");
 }
 
+#endif
+
 static void free_output_queue(struct st_client *client)
 {
 	struct st_outmsg *msg = client->head;
@@ -179,15 +185,15 @@ static int flush_output(struct st_client *client)
 			nw = write(client->base.fd, msg->buf + msg->pos, msg->len - msg->pos);
 			if(nw > 0)
 			{
-				printf(
-						"write fd=%d nw=%zd pos=%zu/%zu queued_bytes=%zu func=%s\n",
-						client->base.fd,
-						nw,
-						msg->pos + nw,
-						msg->len,
-						client->queued_bytes,
-						__func__
-					  );
+				LOG(LOG_DEBUG,
+					"%s: fd=%d nw=%zd pos=%zu/%zu queued_bytes=%zu",
+					__func__,
+					client->base.fd,
+					nw,
+					msg->pos + nw,
+					msg->len,
+					client->queued_bytes
+				  );
 
 				msg->pos += nw;
 				client->queued_bytes -= nw;
@@ -205,14 +211,14 @@ static int flush_output(struct st_client *client)
 
 			if (nw == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
 			{
-				printf(
-						"write EAGAIN fd=%d pos=%zu len=%zu queued_bytes=%zu func=%s\n",
+				LOG(LOG_DEBUG,
+						"%s: EAGAIN fd=%d pos=%zu len=%zu queued_bytes=%zu",
+						__func__,
 						client->base.fd,
 						msg->pos,
 						msg->len,
-						client->queued_bytes,
-						__func__
-					  );
+						client->queued_bytes
+				   );
 				return 0;
 			}
 			perror("write");
@@ -277,7 +283,7 @@ static int accept_client(int epoll_fd, int sfd)
 				free(client);
 				return -1; 
 			}
-			printf("connected. client fd:%d\n", cfd);
+			LOG(LOG_DEBUG, "%s: connected. client fd:%d", __func__, cfd);
 
 			active_clients++; // 現在の接続数を+1
 			
@@ -305,8 +311,9 @@ int process_input(struct st_client *client)
 			client->queued_bytes > QUEUE_MAX_BYTES ||
 			line_len > QUEUE_MAX_BYTES - client->queued_bytes)
 		{
-			fprintf(stderr,
-				"output queue limit exceeded fd=%d\n",
+			LOG(LOG_ERROR,
+				"%s: output queue limit exceeded fd=%d",
+				__func__,
 				client->base.fd);
 			return -1;
 		}
@@ -315,7 +322,7 @@ int process_input(struct st_client *client)
 		if(msg == NULL)
 		{
 			return -1;
-		}
+	}
 
 		memcpy(msg->buf, client->in_buf, line_len);
 
@@ -361,7 +368,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 	
 	if(events & EPOLLOUT)
 	{
-		printf("EPOLLOUT fd=%d\n", client->base.fd);
+		LOG(LOG_DEBUG,"%s: EPOLLOUT fd=%d", __func__, client->base.fd);
 		int ret = process_and_flush(client);
 		if(ret != 0)
 		{
@@ -371,7 +378,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 
 	if((events & EPOLLIN) && !client->read_paused)
 	{
-		printf("EPOLLIN fd=%d\n", client->base.fd);
+		LOG(LOG_DEBUG, "%s: EPOLLIN fd=%d", __func__, client->base.fd);
 		for(;;)
 		{
 			if(client->queued_bytes >= QUEUE_HIGH_WATER) 
@@ -381,7 +388,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 
 			if(client->in_len == BUFF_SIZE)
 			{
-				fprintf(stderr, "input buffer full fd=%d\n", client->base.fd);
+				LOG(LOG_ERROR, "%s: input buffer full fd=%d", __func__, client->base.fd);
 				return -1;
 			}
 
@@ -404,7 +411,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 			}
 			if(nr == 0)
 			{
-				printf("disconnetcted. client fd:%d\n", client->base.fd);
+				LOG(LOG_DEBUG, "%s: disconnetcted. client fd:%d", __func__, client->base.fd);
 				return 1;
 			}
 			if(nr == -1 && errno == EINTR)
@@ -417,7 +424,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 			}
 			if( nr == -1 && errno == ECONNRESET )
 			{
-				printf("receive ECONNRESET. disconnected. client fd:%d\n", client->base.fd); 
+				LOG(LOG_ERROR, "%s: receive ECONNRESET. disconnected. client fd:%d", __func__, client->base.fd); 
 				return 1;
 			} 
 			perror("read");
@@ -441,7 +448,9 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 
 	if(old_paused != client->read_paused)
 	{
-		dump_client(client);
+		#if LOG_LEVEL >= LOG_DEBUG
+			dump_client(client);
+		#endif
 	}
 
 	if(!client->read_paused)
@@ -478,8 +487,8 @@ static int health_check(int tfd)
 		nr = read(tfd, &expirations, sizeof(expirations));
 		if( nr == sizeof(expirations) )
 		{	
-			printf("active clients: %d\n", active_clients);
-			printf("timer fired: %llu time(s)\n", (unsigned long long)expirations);
+			LOG(LOG_INFO, "%s: active clients: %d", __func__, active_clients);
+			LOG(LOG_INFO, "%s: timer fired: %llu time(s)", __func__, (unsigned long long)expirations);
 			break;
 		}
 		if ( nr < 0 )
@@ -512,12 +521,12 @@ static int handle_signal(int fd)
 			}
 			if(fdsi.ssi_signo == SIGTERM) 
 			{
-				printf("Got SIGTERM\n");
+				LOG(LOG_INFO, "Got SIGTERM");
 				return 1;
 			}
 			if(fdsi.ssi_signo == SIGQUIT) 
 			{
-				printf("Got SIGQUIT\n");
+				LOG(LOG_INFO, "Got SIGQUIT");
 				return 1;
 			}
 		}	
@@ -676,7 +685,7 @@ int main (void)
 	}
 
 	struct epoll_event events[EVENT_NUM];
-	printf("listening on 8080\n");
+	LOG(LOG_INFO, "listening on 8080");
 
 	// epoll event loop
 	for(;;)
@@ -721,7 +730,7 @@ int main (void)
 				}
 				else if(ret == 1)
 				{
-					printf("Clean up and Exit.\n");
+					LOG(LOG_INFO, "Clean up and Exit.");
 					close(sfd);
 					close(timer_fd);
 					close(signal_fd);
@@ -744,7 +753,7 @@ int main (void)
 				int ret = handle_client(epoll_fd, client, events[n].events);
 				if(ret == -1)
 				{
-					fprintf(stderr, "get -1 from handle_client,\nsocket close fd=%d\n", client->base.fd);
+					LOG(LOG_ERROR, "%s: get -1 from handle_client,\nsocket close fd=%d", __func__, client->base.fd);
 					close(client->base.fd);
 					active_clients--;
 					free_output_queue(client);
