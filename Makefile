@@ -1,6 +1,6 @@
 CC := gcc
 CFLAGS ?= -Wall -Wextra -Wpedantic -Og -g
-CPPFLAGS ?=
+CPPFLAGS ?= -Iinclude -DLOG_LEVEL=LOG_INFO
 LDFLAGS ?=
 LDLIBS ?=
 
@@ -16,14 +16,15 @@ SANITIZE_FLAGS := -fsanitize=address,undefined \
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES) | build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+$(TARGET): $(SOURCES) include/log.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SOURCES) $(LDLIBS)
+
 
 sanitize: $(SANITIZE_TARGET)
 
-$(SANITIZE_TARGET): $(SOURCES) | build
+$(SANITIZE_TARGET): $(SOURCES) include/log.h | build
 	$(CC) $(CPPFLAGS) $(SANITIZE_FLAGS) \
-		$(LDFLAGS) -o $@ $^ $(LDLIBS)
+		$(LDFLAGS) -o $@ $(SOURCES) $(LDLIBS)
 
 build:
 	mkdir -p $@
