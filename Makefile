@@ -9,9 +9,10 @@ SANITIZE_TARGET := build/server-sanitize
 SOURCES := src/server.c
 
 SANITIZE_FLAGS := -fsanitize=address,undefined \
-				  -fno-omit-frame-pointer
+				  -fno-omit-frame-pointer \
+				  -fno-sanitize-recover=undefined
 
-.PHONY: all run sanitizze run-sanitize clean
+.PHONY: all run sanitize run-sanitize clean
 
 all: $(TARGET)
 
