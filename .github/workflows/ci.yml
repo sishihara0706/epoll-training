@@ -21,3 +21,142 @@ jobs:
 
       - name: Check build output
         run: ls -lh build/
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: epoll-server
+          path: build/server
+          if-no-files-found: error
+
+  sanitize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with Sanitizers
+        run: make sanitize
+
+      - name: Run sanitizer test
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+
+          ./build/server-sanitize > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "$SERVER_PID" > server.pid
+
+          cleanup() {
+            test_status=$?
+            trap - EXIT
+            set +e
+
+            # Request graceful shutdown
+            kill -TERM "$SERVER_PID" 2>/dev/null || true
+
+            # Collect server exit status
+            wait "$SERVER_PID"
+            server_status=$?
+
+            echo "=== Server log ==="
+            cat server.log
+
+            if [ "$server_status" -ne 0 ]; then
+              echo "::error::Server exited with status $server_status"
+              exit 1
+            fi
+
+            exit "$test_status"
+          }
+
+          trap cleanup EXIT
+
+          # Wait for server readiness
+          ready=0
+          for i in {1..20}; do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "Server terminated unexpectedly"
+              cat server.log
+              exit 1
+            fi
+
+            if (true > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+              ready=1 
+              break
+            fi
+
+            sleep 0.5
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Server readiness timeout"
+            exit 1
+          fi
+
+          echo "Server is ready"
+
+          # Execute load test
+          python3 tests/load_test.py
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: epoll-server
+          path: build/
+
+      - name: Start server
+        shell: bash
+        run: |
+          chmod +x build/server
+          ./build/server > server.log 2>&1 &
+          SERVER_PID=$!
+          echo "$SERVER_PID" > server.pid
+
+          for i in {1..20}; do
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "Server terminated unexpectedly"
+              cat server.log
+              exit 1
+            fi
+
+            if (true > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+              echo "Server is ready"
+              exit 0
+            fi
+
+            sleep 0.5
+          done
+
+          echo "Server readiness timeout"
+          cat server.log
+          exit 1
+
+      - name: Run load test
+        run: |
+          python3 tests/load_test.py
+
+      - name: Step server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then
+            kill "$(cat server.pid)" 2>/dev/null || true
+          fi
+
+      - name: Print server log
+        if: always()
+        run: cat server.log || true
