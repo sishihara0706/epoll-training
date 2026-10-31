@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY Makefile .
 COPY src/ ./src
+COPY include/ ./include/
 
 RUN make
 
