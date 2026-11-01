@@ -167,6 +167,9 @@ jobs:
           name: epoll-server
           path: build/
 
+      - name: Restore executable permission
+        run: chmod +x build/server
+
       - name: Load test
         run: bash tests/run_test.sh tests/load_test.py
 

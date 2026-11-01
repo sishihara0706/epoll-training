@@ -73,7 +73,6 @@ trap cleanup EXIT
 
 echo "=== Starting server ==="
 
-chmod +x "$SERVER_BIN"
 "$SERVER_BIN" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
