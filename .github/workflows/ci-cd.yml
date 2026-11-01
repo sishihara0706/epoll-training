@@ -174,13 +174,10 @@ jobs:
         run: bash tests/run_test.sh tests/load_test.py
 
       - name: Backpressure recovery test
-        run: bash tests/run_test.sh tests/backpressure_recovery.py
+        run: bash tests/run_test.sh tests/backpressure_recovery_test.py
  
       - name: Slow client test
         run: bash tests/run_test.sh tests/slow_client_test.py
-
-      - name: Load test
-        run: bash tests/run_test.sh tests/load_test.py
 
   docker-build:
     needs: changes
