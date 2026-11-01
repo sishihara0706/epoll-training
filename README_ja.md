@@ -200,6 +200,7 @@ docker run --rm -p 8080:8080 epoll-server:local
 
 [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) は push と pull request で次のジョブを実行します。
 
+- `changes`: ルートの `README.md` と `README_ja.md` 以外の変更を判定します。README だけの変更ではビルド・テスト・Sanitizer・Docker ビルド・公開をスキップし、ブランチ保護用のチェック結果は報告します。新規ブランチの push では安全側で CI を実行します。必須チェックがある場合は `[skip ci]` を使わないでください。
 - `build`: コンパイルし、`build/server` を `epoll-server` artifact として保存します。
 - `test`: artifact のバイナリでサーバーを起動し、`tests/load_test.py` で各 Echo の内容を照合します。接続や I/O にはタイムアウトを設けています。
 - `sanitize`: ASan／UBSan 付きでビルドして同じ負荷試験を実行し、終了処理ではサーバーの終了ステータスも確認します。

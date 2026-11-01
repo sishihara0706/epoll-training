@@ -200,6 +200,7 @@ The image uses `gcc:14`, runs `make`, and starts `/app/build/server`. The host's
 
 [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) runs on pushes and pull requests:
 
+- `changes`: check for changes outside root `README.md` and `README_ja.md`. README-only changes skip build, test, sanitizer, Docker build, and publishing jobs while reporting skipped checks for branch protection. New branch pushes run CI conservatively. Avoid `[skip ci]` when checks are required.
 - `build`: compile and upload `build/server` as the `epoll-server` artifact.
 - `test`: download that binary, start the server, and run `tests/load_test.py`, checking every echo and applying connection/I/O timeouts.
 - `sanitize`: build with ASan/UBSan and run the same load test, checking the server exit status during cleanup.
