@@ -179,6 +179,9 @@ jobs:
       - name: Slow client test
         run: bash tests/run_test.sh tests/slow_client_test.py
 
+      - name: Protocol test
+        run: bash tests/run_test.sh tests/protocol_test.py
+
   docker-build:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
