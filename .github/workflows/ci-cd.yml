@@ -167,47 +167,20 @@ jobs:
           name: epoll-server
           path: build/
 
-      - name: Start server
-        shell: bash
-        run: |
-          chmod +x build/server
-          ./build/server > server.log 2>&1 &
-          SERVER_PID=$!
-          echo "$SERVER_PID" > server.pid
+      - name: Restore executable permission
+        run: chmod +x build/server
 
-          for i in {1..20}; do
-            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-              echo "Server terminated unexpectedly"
-              cat server.log
-              exit 1
-            fi
+      - name: Load test
+        run: bash tests/run_test.sh tests/load_test.py
 
-            if (true > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
-              echo "Server is ready"
-              exit 0
-            fi
+      - name: Backpressure recovery test
+        run: bash tests/run_test.sh tests/backpressure_recovery_test.py
+ 
+      - name: Slow client test
+        run: bash tests/run_test.sh tests/slow_client_test.py
 
-            sleep 0.5
-          done
-
-          echo "Server readiness timeout"
-          cat server.log
-          exit 1
-
-      - name: Run load test
-        run: |
-          python3 tests/load_test.py
-
-      - name: Step server
-        if: always()
-        run: |
-          if [ -f server.pid ]; then
-            kill "$(cat server.pid)" 2>/dev/null || true
-          fi
-
-      - name: Print server log
-        if: always()
-        run: cat server.log || true
+      - name: Protocol test
+        run: bash tests/run_test.sh tests/protocol_test.py
 
   docker-build:
     needs: changes
