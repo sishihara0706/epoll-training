@@ -21,16 +21,14 @@ Linux の `epoll`、ノンブロッキング I/O、TCP ストリーム処理、�
 
 ## 最近の更新
 
-元の README に反映されていなかった最近の変更は次のとおりです。
+前回の README 更新以降の主な変更です。
 
-- 完全な入力行ごとにクライアント固有の linked-list 出力キューへコピーします。遅いクライアントに複数のレスポンスが滞留しても、メッセージの順序を維持できます。
-- キュー内の byte 数とメッセージ数を追跡します。partial write が成功するたびに byte 数を減らし、送信を完了したキューノードはすぐに解放します。
-- read-side throttling に hysteresis を導入しました。キュー内の未送信データが 64 KiB に達すると `EPOLLIN` を停止し、32 KiB 以下になると再開します。high-water mark 未満では、`EPOLLIN` と `EPOLLOUT` を同時に監視する場合があります。
-- クライアントの切断またはエラー時に、残っている出力キューを解放します。
-- 入力をクライアントごとに蓄積し、TCP の read 境界をメッセージ境界とみなさず、改行で区切られた完全なメッセージへ分割します。
-- `SIGINT`、`SIGTERM`、`SIGQUIT` を block して `signalfd` から読み取り、終了処理も `epoll` イベントループ内で行うようになりました。
-- build、run、clean の標準ターゲットを持つ `Makefile` を追加しました。
-- 継続的なバックプレッシャーを意図的に起こす `no_reader_test.py` を追加しました。
+- ソース、ヘッダー、テストを `src/`、`include/`、`tests/` に整理し、ビルド出力先を `build/` に変更しました。
+- コンパイル時のログレベル設定を追加し、エラー、通常情報、クライアントの I/O やキューの詳細を切り替えられるようにしました。
+- GCC 14 を使ってビルド・実行する Dockerfile を追加しました。
+- GitHub Actions でビルド、Echo の負荷試験、AddressSanitizer／UndefinedBehaviorSanitizer を使った負荷試験、Docker ビルドを実行します。
+- `main` への push で全チェックが成功すると、コミット単位のタグ付き Docker イメージを GHCR へ公開します。
+- JSON メッセージ、バックプレッシャーからの復帰、複数クライアント、レスポンスを読まないクライアントの影響を確認するテストを追加しました。
 
 ## イベントループの構成
 
@@ -148,7 +146,7 @@ make run
 サーバーは全 interface の TCP port `8080` で待ち受けます。
 
 ```text
-listening on 8080
+[INFO] listening on 8080
 ```
 
 生成した binary を削除する場合は次を実行します。
@@ -160,10 +158,59 @@ make clean
 直接コンパイルする場合の同等のコマンドは次のとおりです。
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Og -g server.c -o server
+mkdir -p build
+gcc -Iinclude -DLOG_LEVEL=LOG_INFO -Wall -Wextra -Wpedantic -Og -g src/server.c -o build/server
 ```
 
 `SO_REUSEADDR` を有効にしているため、以前の TCP 状態が残っていても通常はすぐにサーバーを再起動できます。
+
+## ログレベル
+
+`LOG_LEVEL` はビルド時に指定します。`LOG_ERROR`（0）、`LOG_INFO`（1、デフォルト）、`LOG_DEBUG`（2）があり、各レベルにはそれより低いレベルも含まれます。INFO では起動・終了と10秒ごとの接続数を表示し、DEBUG ではクライアントの I/O やキューのダンプも出力します。ログは stderr に出力します。一部のシステムコールエラーには `perror()` も使っています。
+
+Make はコンパイルオプションの変更を追跡しないため、レベル変更時は再ビルドしてください。
+
+```bash
+make clean
+make LOG_LEVEL=LOG_DEBUG
+make run
+```
+
+## Sanitizer
+
+```bash
+make sanitize
+make run-sanitize
+```
+
+AddressSanitizer と UndefinedBehaviorSanitizer を有効にした `build/server-sanitize` を生成します。別の terminal で `python3 tests/load_test.py` を実行して負荷をかけられます。`make clean` は通常版と Sanitizer 版の両方を削除します。
+
+## Docker
+
+Docker が利用できる環境で、リポジトリのルートから実行します。
+
+```bash
+docker build -t epoll-server:local .
+docker run --rm -p 8080:8080 epoll-server:local
+```
+
+イメージは `gcc:14` 上で `make` を実行し、`/app/build/server` を起動します。ホストの port 8080 が空いている必要があります。停止には `docker stop <container-id>` を使います。
+
+## CI/CD と GHCR
+
+[`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) は push と pull request で次のジョブを実行します。
+
+- `build`: コンパイルし、`build/server` を `epoll-server` artifact として保存します。
+- `test`: artifact のバイナリでサーバーを起動し、`tests/load_test.py` で各 Echo の内容を照合します。接続や I/O にはタイムアウトを設けています。
+- `sanitize`: ASan／UBSan 付きでビルドして同じ負荷試験を実行し、終了処理ではサーバーの終了ステータスも確認します。
+- `docker-build`: Docker イメージのビルドを確認します。
+- `publish`: 上記4ジョブが成功し、かつ `main` への push の場合にのみ、`packages: write` 権限の `GITHUB_TOKEN` を使って `ghcr.io/sishihara0706/epoll-training` へ公開します。
+
+タグは `sha-<コミットの完全な SHA>` です。`latest` タグは作成しません。公開済みイメージを実行するには、以下の `<full-commit-sha>` を公開に成功したコミットの SHA に置き換えます（レジストリへのアクセス権が必要です）。
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/sishihara0706/epoll-training:sha-<full-commit-sha>
+```
 
 ## 終了処理
 
@@ -192,7 +239,7 @@ nc 127.0.0.1 8080
 ### 同時接続テスト
 
 ```bash
-./clients-connect.sh
+bash tests/clients-connect.sh
 ```
 
 100個の `nc` クライアントを同時に開き、それぞれ異なる時間だけ接続を維持します。
@@ -200,7 +247,7 @@ nc 127.0.0.1 8080
 ### Request／response 負荷試験
 
 ```bash
-python3 load_test.py
+python3 tests/load_test.py
 ```
 
 デフォルトでは100クライアントを作り、クライアントごとに1000個の行単位リクエストを送信します。すべての Echo を待った後、経過時間と1秒あたりのメッセージ数を表示します。
@@ -208,7 +255,7 @@ python3 load_test.py
 ### Slow reader テスト
 
 ```bash
-python3 slow_reader_test.py
+python3 tests/slow_reader_test.py
 ```
 
 100クライアントが多数のメッセージを送信し、レスポンスを読まないまま5秒待ってから切断します。これによりサーバー側の `write()` が `EAGAIN` になりやすい状態を作ります。
@@ -216,10 +263,19 @@ python3 slow_reader_test.py
 ### No reader テスト
 
 ```bash
-python3 no_reader_test.py
+python3 tests/no_reader_test.py
 ```
 
 1クライアントが100,000メッセージの送信を試み、Echo を一切読みません。リポジトリ内で最も強いバックプレッシャーテストで、TCP flow control がクライアントまで到達すると `sendall()` で block する場合があります。最後の sleep は観察のために接続を維持します。
+
+### 追加のバックプレッシャーテスト
+
+- `python3 tests/no_reader_test_real_msg.py`: 改行区切りの JSON を送信し、レスポンスを読みません。
+- `python3 tests/backpressure_recovery_test.py`: 一時停止後に受信を再開し、5000件すべてのレスポンスと順序を検証します。
+- `python3 tests/multi_client_test.py`: 20クライアントが受信を遅らせた後、レスポンスの内容と順序を検証します。
+- `python3 tests/slow_client_test.py`: レスポンスを読まない1クライアントと並行して、通常の19クライアントを検証し、遅延を表示します。
+
+これらは手動実行用です。現在の CI では `tests/load_test.py` を実行します。
 
 各 Python ファイル内の workload 値を小さくすれば、短時間で試せます。
 
@@ -242,11 +298,11 @@ strace -p "$(pidof server)" \
   -e trace=epoll_wait,epoll_ctl,accept4,read,write
 ```
 
-バックプレッシャーテスト中は、次の server log が手掛かりになります。
+バックプレッシャーの詳細を観察するには `LOG_LEVEL=LOG_DEBUG` で再ビルドします。次の server log が手掛かりになります。
 
 ```text
-write EAGAIN fd=7 pos=600 len=1000
-EPOLLOUT fd=7
+[DEBUG] flush_output: EAGAIN fd=7 pos=600 len=1000 queued_bytes=400
+[DEBUG] handle_client: EPOLLOUT fd=7
 ```
 
 最初の行は partial write の位置が保存されたことを示します。その後の `EPOLLOUT` event で、その位置から送信を再開します。
@@ -290,8 +346,8 @@ read() == 0
 - `EPOLLERR`、`EPOLLHUP`、`EPOLLRDHUP` の明示的な処理
 - `QUEUE_MAX_BYTES` と `QUEUE_MAX_MESSAGES` による hard limit の適用。定数は定義済みですが、現在のキュー処理が行うのは high/low-water read throttling だけです
 - graceful shutdown 時に接続中クライアントを drain
-- address、port、buffer size、logging の設定可能化
-- 自動 integration test
+- address、port、buffer size、実行時のログレベルの設定可能化
+- CI の負荷試験以外への自動 integration test の拡充
 - 接続数や throughput の統計
 - `select`、`poll`、edge-triggered `EPOLLET` との比較
 - より大規模な latency／throughput 計測

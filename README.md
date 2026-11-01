@@ -21,16 +21,14 @@ The program is a newline-delimited TCP echo server. A single `epoll` event loop 
 
 ## Recent updates
 
-The latest changes add behavior that was not covered by the original README:
+Recent changes since the previous README update:
 
-- Each complete input line is copied into a per-client linked-list output queue, so multiple responses can wait for the same slow client without losing message order.
-- The server tracks queued bytes and messages. Bytes are subtracted as partial writes succeed, and completed queue nodes are released immediately.
-- Read-side throttling now uses hysteresis: `EPOLLIN` is paused when queued output reaches 64 KiB and resumed after it falls to 32 KiB or less. Below the high-water mark, `EPOLLIN` and `EPOLLOUT` may be monitored together.
-- A client's remaining output queue is released when that client disconnects or encounters an error.
-- Input is accumulated per client and split into complete newline-delimited messages instead of treating TCP read boundaries as message boundaries.
-- `SIGINT`, `SIGTERM`, and `SIGQUIT` are blocked and consumed through `signalfd`, allowing shutdown to remain part of the `epoll` event loop.
-- A `Makefile` now provides standard build, run, and clean targets.
-- `no_reader_test.py` was added to deliberately exercise sustained backpressure.
+- Source, headers, and test programs now live in `src/`, `include/`, and `tests/`; build outputs go to `build/`.
+- Compile-time log levels control error, informational, and debug output, including client queue dumps.
+- Docker support builds and runs the server with GCC 14.
+- GitHub Actions builds the server, checks echo responses under load, runs the load test with AddressSanitizer and UndefinedBehaviorSanitizer, and verifies the Docker build.
+- Successful pushes to `main` publish a commit-tagged Docker image to GHCR.
+- Additional tests cover JSON messages, recovery after backpressure, multiple clients, and isolation of a client that does not read responses.
 
 ## Event-loop design
 
@@ -148,7 +146,7 @@ make run
 The server listens on all interfaces on TCP port `8080`:
 
 ```text
-listening on 8080
+[INFO] listening on 8080
 ```
 
 To remove the compiled binary:
@@ -160,10 +158,59 @@ make clean
 The equivalent direct compilation command is:
 
 ```bash
-gcc -Wall -Wextra -Wpedantic -Og -g server.c -o server
+mkdir -p build
+gcc -Iinclude -DLOG_LEVEL=LOG_INFO -Wall -Wextra -Wpedantic -Og -g src/server.c -o build/server
 ```
 
 `SO_REUSEADDR` is enabled so the server can usually be restarted without waiting for old TCP state to expire.
+
+## Logging
+
+`LOG_LEVEL` is selected at build time: `LOG_ERROR` (0), `LOG_INFO` (1, default), or `LOG_DEBUG` (2). Each level includes the lower levels. INFO includes startup, shutdown, and active-client reports every 10 seconds; DEBUG adds per-client I/O details and queue dumps. Log messages use stderr; some system-call errors also use `perror()`.
+
+Rebuild when changing the level, because Make does not track changes to compiler options:
+
+```bash
+make clean
+make LOG_LEVEL=LOG_DEBUG
+make run
+```
+
+## Sanitizers
+
+```bash
+make sanitize
+make run-sanitize
+```
+
+This builds `build/server-sanitize` with AddressSanitizer and UndefinedBehaviorSanitizer. Run `python3 tests/load_test.py` from another terminal to exercise it. `make clean` removes both normal and sanitizer binaries.
+
+## Docker
+
+Build and run from the repository root (Docker is required):
+
+```bash
+docker build -t epoll-server:local .
+docker run --rm -p 8080:8080 epoll-server:local
+```
+
+The image uses `gcc:14`, runs `make`, and starts `/app/build/server`. The host's port 8080 must be available. Stop the container with `docker stop <container-id>`.
+
+## CI/CD and GHCR
+
+[`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) runs on pushes and pull requests:
+
+- `build`: compile and upload `build/server` as the `epoll-server` artifact.
+- `test`: download that binary, start the server, and run `tests/load_test.py`, checking every echo and applying connection/I/O timeouts.
+- `sanitize`: build with ASan/UBSan and run the same load test, checking the server exit status during cleanup.
+- `docker-build`: verify that the Docker image builds.
+- `publish`: after all four jobs pass, publish to `ghcr.io/sishihara0706/epoll-training` only for pushes to `main`, using `GITHUB_TOKEN` with `packages: write`.
+
+Images are tagged `sha-<full commit SHA>`; the workflow does not create a `latest` tag. To run a published image, replace `<full-commit-sha>` with the SHA of a successful publishing commit (registry access is required):
+
+```bash
+docker run --rm -p 8080:8080 ghcr.io/sishihara0706/epoll-training:sha-<full-commit-sha>
+```
 
 ## Shutdown
 
@@ -192,7 +239,7 @@ Each newline-terminated message is echoed exactly once.
 ### Concurrent connections
 
 ```bash
-./clients-connect.sh
+bash tests/clients-connect.sh
 ```
 
 This opens 100 concurrent `nc` clients and keeps them connected for varying lengths of time.
@@ -200,7 +247,7 @@ This opens 100 concurrent `nc` clients and keeps them connected for varying leng
 ### Request/response load test
 
 ```bash
-python3 load_test.py
+python3 tests/load_test.py
 ```
 
 The default configuration creates 100 clients, sends 1000 line-based requests per client, waits for every echo, and reports elapsed time and messages per second.
@@ -208,7 +255,7 @@ The default configuration creates 100 clients, sends 1000 line-based requests pe
 ### Slow-reader test
 
 ```bash
-python3 slow_reader_test.py
+python3 tests/slow_reader_test.py
 ```
 
 One hundred clients send many messages without reading the responses, wait for five seconds, and then close. This makes server-side writes more likely to reach `EAGAIN`.
@@ -216,10 +263,19 @@ One hundred clients send many messages without reading the responses, wait for f
 ### No-reader test
 
 ```bash
-python3 no_reader_test.py
+python3 tests/no_reader_test.py
 ```
 
 One client attempts to send 100,000 messages and never reads the echoed data. This is the strongest backpressure test in the repository: it can block in `sendall()` once TCP flow control reaches the client. Its final sleep keeps the connection available for inspection.
+
+### Additional backpressure tests
+
+- `python3 tests/no_reader_test_real_msg.py`: send newline-delimited JSON without reading responses.
+- `python3 tests/backpressure_recovery_test.py`: resume reading after a pause and verify all 5000 responses in order.
+- `python3 tests/multi_client_test.py`: verify ordered responses for 20 clients after delaying reads.
+- `python3 tests/slow_client_test.py`: check 19 normal clients while one client does not read responses, and report normal-client latency.
+
+These tests are run manually; CI currently runs `tests/load_test.py`.
 
 The workload values in the Python files can be reduced for shorter runs.
 
@@ -242,11 +298,11 @@ strace -p "$(pidof server)" \
   -e trace=epoll_wait,epoll_ctl,accept4,read,write
 ```
 
-During a backpressure test, useful server log lines include:
+Rebuild with `LOG_LEVEL=LOG_DEBUG` to observe backpressure details. Useful server log lines include:
 
 ```text
-write EAGAIN fd=7 pos=600 len=1000
-EPOLLOUT fd=7
+[DEBUG] flush_output: EAGAIN fd=7 pos=600 len=1000 queued_bytes=400
+[DEBUG] handle_client: EPOLLOUT fd=7
 ```
 
 The first line shows a saved partial-write position. The later `EPOLLOUT` event allows the server to continue from that position.
@@ -290,8 +346,8 @@ The server was developed incrementally as a Linux systems programming exercise, 
 - Explicit handling for `EPOLLERR`, `EPOLLHUP`, and `EPOLLRDHUP`
 - Enforcement of the `QUEUE_MAX_BYTES` and `QUEUE_MAX_MESSAGES` hard limits; the constants exist, but the current queue logic only applies high/low-water read throttling
 - Draining active clients during graceful shutdown
-- Configurable address, port, buffer sizes, and logging
-- Automated integration tests
+- Configurable address, port, buffer sizes, and runtime log levels
+- Broader automated integration coverage beyond the CI load test
 - Connection and throughput statistics
 - Comparisons with `select`, `poll`, and edge-triggered `EPOLLET`
 - Larger-scale latency and throughput measurements
