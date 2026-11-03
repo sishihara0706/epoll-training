@@ -33,3 +33,18 @@ jobs:
           timeout 10 bash -c \
             'echo > /dev/tcp/100.72.72.20/22'
           echo "Fedora SSH port is reachable"
+
+      - name: Test SSH authentication
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/epoll_cd_ed25519
+          chmod 600 ~/.ssh/epoll_cd_ed25519
+
+          # FedoraのSSHホスト鍵を事前登録
+          # 実際のホスト公開鍵を検証して登録する
+          ssh-keygen -y -f ~/.ssh/epoll_cd_ed25519 > /dev/null
+
