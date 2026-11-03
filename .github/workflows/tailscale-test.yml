@@ -1,0 +1,35 @@
+name: Tailscale Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tailscale-test:
+    runs-on: ubuntu-latest
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+
+      - name: Check Tailscale connection
+        run: |
+          tailscale status
+          tailscale ping --timeout=10s 100.72.72.20
+
+      - name: Check Fedora SSH port
+        run: |
+          timeout 10 bash -c \
+            'echo > /dev/tcp/100.72.72.20/22'
+          echo "Fedora SSH port is reachable"
