@@ -26,7 +26,7 @@ jobs:
       - name: Check Tailscale connection
         run: |
           tailscale status
-          tailscale ping --timeout=10s 100.72.72.20
+          tailscale ping --until-direct=false --c=1 --timeout=10s 100.72.72.20
 
       - name: Check Fedora SSH port
         run: |
