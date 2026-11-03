@@ -37,14 +37,30 @@ jobs:
       - name: Test SSH authentication
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          FEDORA_SSH_HOST_KEY: ${{ secrets.FEDORA_SSH_HOST_KEY }}
         run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+          set -euo pipefail
+
+          install -d -m 700 ~/.ssh
 
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/epoll_cd_ed25519
           chmod 600 ~/.ssh/epoll_cd_ed25519
 
-          # FedoraのSSHホスト鍵を事前登録
-          # 実際のホスト公開鍵を検証して登録する
+          # SSH秘密鍵の形式を検証
           ssh-keygen -y -f ~/.ssh/epoll_cd_ed25519 > /dev/null
+
+          # 信頼済みのFedoraホスト鍵を登録
+          read -r key_type key_data _ <<< "$FEDORA_SSH_HOST_KEY"
+          printf '100.72.72.20 %s %s\n' \
+            "$key_type" "$key_data" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          # Fedoraへ実際にSSH接続
+          ssh -i ~/.ssh/epoll_cd_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            epolldeploy@100.72.72.20 \
+            'whoami && systemctl --user is-active epoll-server.service'
 
