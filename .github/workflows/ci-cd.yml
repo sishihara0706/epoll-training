@@ -199,6 +199,9 @@ jobs:
     if: needs.changes.outputs.run_ci == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
     permissions:
       contents: read
       packages: write
@@ -226,10 +229,75 @@ jobs:
             type=sha,format=long
 
       - name: Build and push Docker image
+        id: push
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    concurrency:
+      group: epoll-production-deploy
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          ping: 100.72.72.20
+
+      - name: Setup SSH
+        shell: bash
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          FEDORA_SSH_HOST_KEY: ${{ secrets.FEDORA_SSH_HOST_KEY }}
+        run: |
+          set -euo pipefail
+
+          install -d -m 700 ~/.ssh
+
+          printf '%s\n' "$DEPLOY_SSH_KEY" \
+            > ~/.ssh/epoll_cd_ed25519
+          chmod 600 ~/.ssh/epoll_cd_ed25519
+
+          read -r key_type key_data _ <<< "$FEDORA_SSH_HOST_KEY"
+          test "$key_type" = "ssh-ed25519"
+          test -n "$key_data"
+
+          printf '100.72.72.20 %s %s\n' \
+            "$key_type" "$key_data" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy to Fedora
+        shell: bash
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository }}@${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/epoll_cd_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=10 \
+            epolldeploy@100.72.72.20 \
+            bash -s -- "$IMAGE_REF" < scripts/deploy.sh
 
