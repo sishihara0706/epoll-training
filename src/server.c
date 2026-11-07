@@ -577,6 +577,8 @@ int main (void)
 		return -1;
 	}
 
+	LOG(LOG_INFO, "epoll-server version 1.1");
+
 	memset(&my_addr, 0, sizeof(my_addr));
 	my_addr.sin_family = AF_INET;
 	my_addr.sin_port = htons(PORT);
