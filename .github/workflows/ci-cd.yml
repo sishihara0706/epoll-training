@@ -182,6 +182,9 @@ jobs:
       - name: Protocol test
         run: bash tests/run_test.sh tests/protocol_test.py
 
+      - name: Idle timeout test
+        run: bash tests/run_test.sh tests/idle_timeout_test.py
+
   docker-build:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
