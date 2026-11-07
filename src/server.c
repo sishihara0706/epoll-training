@@ -19,7 +19,9 @@
 #define EVENT_NUM			1000
 #define BUFF_SIZE			4096
 #define LISTEN_NUM			128
+#ifndef IDLE_TIMEOUT_SECONDS
 #define IDLE_TIMEOUT_SECONDS 60
+#endif
 
 #define QUEUE_HIGH_WATER	(64 * 1024)
 #define QUEUE_LOW_WATER 	(32 * 1024)

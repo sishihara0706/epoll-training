@@ -4,6 +4,8 @@ import time
 
 HOST = '127.0.0.1'
 PORT = 8080
+# Matches the dedicated idle-test build targets in the Makefile.
+IDLE_TIMEOUT = 4
 
 
 def connect():
@@ -30,21 +32,21 @@ def main():
         reset.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
         reset.close()
         partial.sendall(b'partial')
-        for i in range(5):
-            time.sleep(max(0, start + (i + 1) * 10 - time.monotonic()))
+        for i in range(2):
+            time.sleep(max(0, start + (i + 1) - time.monotonic()))
             echo(active, b'active\n')
-        time.sleep(max(0, start + 58 - time.monotonic()))
+        time.sleep(max(0, start + IDLE_TIMEOUT - 1 - time.monotonic()))
         idle.settimeout(0.5)
         try:
             data = idle.recv(1)
         except socket.timeout:
             pass
         else:
-            raise AssertionError(f'idle connection closed before 60 seconds: {data!r}')
+            raise AssertionError(f'idle connection closed before the timeout: {data!r}')
         echo(active, b'before\n')
         idle.settimeout(5)
         assert idle.recv(1) == b'', 'idle connection was not closed'
-        assert time.monotonic() - start >= 60, 'idle connection closed too early'
+        assert time.monotonic() - start >= IDLE_TIMEOUT, 'idle connection closed too early'
         partial.settimeout(5)
         assert partial.recv(1) == b'', 'partial input did not time out'
         echo(active, b'after\n')
