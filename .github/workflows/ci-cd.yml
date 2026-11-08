@@ -151,6 +151,13 @@ jobs:
           # Execute load test
           python3 tests/load_test.py
 
+      - name: Run metrics sanitizer test
+        env:
+          SERVER_BIN: ./build/server-sanitize
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: bash tests/run_test.sh tests/metrics_test.py
+
       - name: Run idle timeout sanitizer test
         env:
           SERVER_BIN: ./build/server-idle-test-sanitize
@@ -185,6 +192,9 @@ jobs:
  
       - name: Slow client test
         run: bash tests/run_test.sh tests/slow_client_test.py
+
+      - name: Metrics test
+        run: bash tests/run_test.sh tests/metrics_test.py
 
       - name: Protocol test
         run: bash tests/run_test.sh tests/protocol_test.py
