@@ -11,6 +11,7 @@
 #include<signal.h>
 #include<sys/timerfd.h>
 #include<sys/signalfd.h>
+#include<time.h>
 
 #include "log.h"
 
@@ -18,6 +19,9 @@
 #define EVENT_NUM			1000
 #define BUFF_SIZE			4096
 #define LISTEN_NUM			128
+#ifndef IDLE_TIMEOUT_SECONDS
+#define IDLE_TIMEOUT_SECONDS 60
+#endif
 
 #define QUEUE_HIGH_WATER	(64 * 1024)
 #define QUEUE_LOW_WATER 	(32 * 1024)
@@ -25,6 +29,7 @@
 #define QUEUE_MAX_MESSAGES	1024
 
 static int active_clients;
+static struct st_client *clients;
 
 enum fd_type
 {
@@ -60,6 +65,9 @@ struct st_client {
 	size_t queued_bytes;
 	size_t queued_messages;
 	int read_paused;
+	struct timespec last_activity;
+	struct st_client *prev;
+	struct st_client *next;
 };
 
 struct st_timer_info {
@@ -172,6 +180,52 @@ static void free_output_queue(struct st_client *client)
 	client->queued_messages = 0;
 }
 
+static void close_client(struct st_client *client)
+{
+	if(client->prev != NULL)
+		client->prev->next = client->next;
+	else
+		clients = client->next;
+	if(client->next != NULL)
+		client->next->prev = client->prev;
+	close(client->base.fd);
+	active_clients--;
+	free_output_queue(client);
+	free(client);
+}
+
+static int record_activity(struct st_client *client)
+{
+	if(clock_gettime(CLOCK_MONOTONIC, &client->last_activity) == -1)
+	{
+		perror("clock_gettime");
+		return -1;
+	}
+	return 0;
+}
+
+static int expire_idle_clients(void)
+{
+	struct timespec now;
+	if(clock_gettime(CLOCK_MONOTONIC, &now) == -1)
+	{
+		perror("clock_gettime");
+		return -1;
+	}
+	for(struct st_client *client = clients, *next; client != NULL; client = next)
+	{
+		next = client->next;
+		time_t seconds = now.tv_sec - client->last_activity.tv_sec;
+		if(seconds > IDLE_TIMEOUT_SECONDS ||
+		   (seconds == IDLE_TIMEOUT_SECONDS && now.tv_nsec >= client->last_activity.tv_nsec))
+		{
+			LOG(LOG_INFO, "idle timeout fd=%d", client->base.fd);
+			close_client(client);
+		}
+	}
+	return 0;
+}
+
 static int flush_output(struct st_client *client)
 {
 	ssize_t nw;
@@ -195,6 +249,8 @@ static int flush_output(struct st_client *client)
 					client->queued_bytes
 				  );
 
+				if(record_activity(client) == -1)
+					return -1;
 				msg->pos += nw;
 				client->queued_bytes -= nw;
 				continue;
@@ -272,6 +328,12 @@ static int accept_client(int epoll_fd, int sfd)
 			}
 			client->base.type = FD_CLIENT;
 			client->base.fd = cfd;
+			if(record_activity(client) == -1)
+			{
+				close(cfd);
+				free(client);
+				return -1;
+			}
 
 			ev.events = EPOLLIN; 
 			ev.data.ptr = client;
@@ -285,6 +347,10 @@ static int accept_client(int epoll_fd, int sfd)
 			}
 			LOG(LOG_DEBUG, "%s: connected. client fd:%d", __func__, cfd);
 
+			client->next = clients;
+			if(clients != NULL)
+				clients->prev = client;
+			clients = client;
 			active_clients++; // 現在の接続数を+1
 			
 			// さらに接続待ちが残っているかもしれないので続ける
@@ -400,6 +466,8 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 
 			if(nr > 0)
 			{
+				if(record_activity(client) == -1)
+					return -1;
 				client->in_len += nr;
 				int ret = process_and_flush(client);
 				if(ret != 0)
@@ -479,6 +547,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 
 static int health_check(int tfd)
 {
+	static uint64_t ticks;
 	uint64_t expirations;
 	ssize_t nr;
 
@@ -487,8 +556,13 @@ static int health_check(int tfd)
 		nr = read(tfd, &expirations, sizeof(expirations));
 		if( nr == sizeof(expirations) )
 		{	
-			LOG(LOG_INFO, "%s: active clients: %d", __func__, active_clients);
-			LOG(LOG_INFO, "%s: timer fired: %llu time(s)", __func__, (unsigned long long)expirations);
+			ticks += expirations;
+			if(ticks >= 10)
+			{
+				LOG(LOG_INFO, "%s: active clients: %d", __func__, active_clients);
+				LOG(LOG_INFO, "%s: timer fired: %llu time(s)", __func__, (unsigned long long)ticks);
+				ticks %= 10;
+			}
 			break;
 		}
 		if ( nr < 0 )
@@ -627,8 +701,8 @@ int main (void)
 	}
 
 	struct itimerspec timer = {0};
-	timer.it_value.tv_sec = 10;
-	timer.it_interval.tv_sec = 10;
+	timer.it_value.tv_sec = 1;
+	timer.it_interval.tv_sec = 1;
 	if(timerfd_settime(timer_fd, 0, &timer, NULL) == -1)
 	{
 		perror("timerfd_settime");
@@ -701,6 +775,7 @@ int main (void)
 			return -1;
 		}
 
+		int timer_fired = 0;
 		for (n = 0; n < nfds; n++)
 		{
 			struct fd_info *info = events[n].data.ptr;
@@ -720,6 +795,7 @@ int main (void)
 					close(info->fd);
 					return -1;
 				}
+				timer_fired = 1;
 			}
 			else if(info->type == FD_SIGNAL)
 			{
@@ -733,6 +809,8 @@ int main (void)
 				else if(ret == 1)
 				{
 					LOG(LOG_INFO, "Clean up and Exit.");
+					while(clients != NULL)
+						close_client(clients);
 					close(sfd);
 					close(timer_fd);
 					close(signal_fd);
@@ -756,18 +834,12 @@ int main (void)
 				if(ret == -1)
 				{
 					LOG(LOG_ERROR, "%s: get -1 from handle_client,\nsocket close fd=%d", __func__, client->base.fd);
-					close(client->base.fd);
-					active_clients--;
-					free_output_queue(client);
-					free(client);
+					close_client(client);
 					continue;
 				}
 				else if (ret == 1)
 				{
-					close(client->base.fd);
-					active_clients--;
-					free_output_queue(client);
-					free(client);
+					close_client(client);
 					continue;
 				}
 				else
@@ -780,6 +852,9 @@ int main (void)
 				;
 			}
 		}
+		/* Expire only after all pointers returned by epoll_wait have been used. */
+		if(timer_fired && expire_idle_clients() == -1)
+			return -1;
 	}
 
 	return 0;
