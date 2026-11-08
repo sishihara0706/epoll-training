@@ -19,6 +19,12 @@ The program is a newline-delimited TCP echo server. A single `epoll` event loop 
 - Isolated client error handling, including `EPIPE` and connection resets
 - Load, slow-reader, and no-reader test programs
 
+## Prometheus metrics
+
+The server exposes `GET http://127.0.0.1:9091/metrics` in Prometheus text format 0.0.4. For example, run `curl http://127.0.0.1:9091/metrics`. The listener binds only to loopback and is separate from the echo port. Each HTTP connection handles one request and closes after its response. At most 32 HTTP clients are accepted concurrently, requests are limited to 4096 bytes, and connections expire 10 seconds after acceptance. Startup fails if the metrics listener cannot bind.
+
+The metrics report active and cumulative echo connections, bytes received and sent by echo sockets, and the aggregate unsent echo queue bytes. HTTP traffic is excluded; counters reset when the process restarts. `tests/metrics_test.py` exercises the endpoint with the standard test runner.
+
 ## Recent updates
 
 Recent changes since the previous README update:

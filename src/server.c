@@ -36,7 +36,9 @@ enum fd_type
 	FD_LISTENER,
 	FD_TIMER,
 	FD_SIGNAL,
-	FD_CLIENT
+	FD_CLIENT,
+	FD_METRICS_LISTENER,
+	FD_HTTP_CLIENT
 };
 
 struct fd_info
@@ -75,6 +77,164 @@ struct st_timer_info {
 	// unique member
 	
 };
+
+#define METRICS_PORT 9091
+#define HTTP_LIMIT 32
+#define HTTP_REQUEST_LIMIT 4096
+#define HTTP_TIMEOUT_SECONDS 10
+
+static uint64_t connections_total, bytes_received_total, bytes_sent_total;
+static uint64_t queued_bytes_total;
+
+struct http_client {
+	struct fd_info base;
+	struct http_client *next;
+	struct timespec accepted;
+	char request[HTTP_REQUEST_LIMIT + 1];
+	size_t request_len;
+	char response[2048];
+	size_t response_len, response_pos;
+};
+static struct http_client *http_clients;
+static unsigned http_count;
+
+static void http_close(struct http_client *client)
+{
+	struct http_client **p = &http_clients;
+	while(*p != client) p = &(*p)->next;
+	*p = client->next;
+	close(client->base.fd);
+	free(client);
+	http_count--;
+}
+
+static int metrics_listener(void)
+{
+	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if(fd == -1) return -1;
+	int opt = 1;
+	struct sockaddr_in addr = { .sin_family = AF_INET,
+		.sin_port = htons(METRICS_PORT), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+	if(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1 ||
+	   bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == -1 || listen(fd, LISTEN_NUM) == -1)
+	{
+		perror("metrics listener"); close(fd); return -1;
+	}
+	return fd;
+}
+
+static void http_accept(int epoll_fd, int fd)
+{
+	/* Bound work per event even when connections are being rejected. */
+	for(int i = 0; i < HTTP_LIMIT; i++)
+	{
+		int cfd = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+		if(cfd == -1) { if(errno == EINTR) { i--; continue; } break; }
+		if(http_count >= HTTP_LIMIT) { close(cfd); continue; }
+		struct http_client *c = calloc(1, sizeof(*c));
+		if(!c) { close(cfd); continue; }
+		c->base.type = FD_HTTP_CLIENT; c->base.fd = cfd;
+		struct epoll_event ev = { .events = EPOLLIN | EPOLLRDHUP, .data.ptr = c };
+		if(clock_gettime(CLOCK_MONOTONIC, &c->accepted) == -1 ||
+		   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cfd, &ev) == -1)
+		{ close(cfd); free(c); continue; }
+		c->next = http_clients; http_clients = c; http_count++;
+	}
+}
+
+static void http_response(struct http_client *c, int status)
+{
+	char body[1024];
+	int len;
+	if(status == 200)
+		len = snprintf(body, sizeof(body),
+			"# HELP epoll_active_connections Current active echo connections.\n# TYPE epoll_active_connections gauge\nepoll_active_connections %d\n"
+			"# HELP epoll_connections_total Total accepted echo connections.\n# TYPE epoll_connections_total counter\nepoll_connections_total %llu\n"
+			"# HELP epoll_bytes_received_total Total echo bytes received.\n# TYPE epoll_bytes_received_total counter\nepoll_bytes_received_total %llu\n"
+			"# HELP epoll_bytes_sent_total Total echo bytes sent.\n# TYPE epoll_bytes_sent_total counter\nepoll_bytes_sent_total %llu\n"
+			"# HELP epoll_queued_bytes Echo bytes waiting to be sent.\n# TYPE epoll_queued_bytes gauge\nepoll_queued_bytes %llu\n",
+			active_clients, (unsigned long long)connections_total,
+			(unsigned long long)bytes_received_total, (unsigned long long)bytes_sent_total,
+			(unsigned long long)queued_bytes_total);
+	else len = snprintf(body, sizeof(body), "%s\n", status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed" : "Bad Request");
+	if(len < 0 || (size_t)len >= sizeof(body)) { c->response_len = 0; return; }
+	int n = snprintf(c->response, sizeof(c->response),
+		"HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		status, status == 200 ? "OK" : status == 404 ? "Not Found" : status == 405 ? "Method Not Allowed" : "Bad Request",
+		status == 200 ? "text/plain; version=0.0.4; charset=utf-8" : "text/plain; charset=utf-8", len, body);
+	c->response_len = n > 0 && (size_t)n < sizeof(c->response) ? (size_t)n : 0;
+}
+
+static int http_handle(int epoll_fd, struct http_client *c, uint32_t events)
+{
+	if(!c->response_len && (events & EPOLLIN))
+	{
+		for(;;)
+		{
+			ssize_t n = read(c->base.fd, c->request + c->request_len, HTTP_REQUEST_LIMIT - c->request_len);
+			if(n > 0)
+			{
+				c->request_len += (size_t)n; c->request[c->request_len] = '\0';
+				if(memchr(c->request, '\0', c->request_len)) { http_response(c, 400); break; }
+				char *end = strstr(c->request, "\r\n\r\n");
+				if(end)
+				{
+					char method[16], path[1024], version[16], extra;
+					char *line = strstr(c->request, "\r\n");
+					*line = '\0';
+					int fields = sscanf(c->request, "%15s %1023s %15s %c", method, path, version, &extra);
+					int valid = fields == 3 && (!strcmp(version, "HTTP/1.1") || !strcmp(version, "HTTP/1.0"));
+					for(char *p = line + 2; valid && p < end; )
+					{
+						char *next = strstr(p, "\r\n");
+						if(!next || next > end || !memchr(p, ':', (size_t)(next - p)) || *p == ':' || *p == ' ' || *p == '\t') { valid = 0; break; }
+						for(char *q = p; q < next; q++) if((unsigned char)*q < 32 && *q != '\t') valid = 0;
+						p = next + 2;
+					}
+					http_response(c, !valid ? 400 : strcmp(method, "GET") ? 405 : strcmp(path, "/metrics") ? 404 : 200); break;
+				}
+				if(c->request_len == HTTP_REQUEST_LIMIT) { http_response(c, 400); break; }
+				continue;
+			}
+			if(n == 0) return -1;
+			if(errno == EINTR) continue;
+			if(errno == EAGAIN || errno == EWOULDBLOCK) break;
+			return -1;
+		}
+		if(c->response_len)
+		{
+			struct epoll_event ev = { .events = EPOLLOUT | EPOLLRDHUP, .data.ptr = c };
+			if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, c->base.fd, &ev) == -1) return -1;
+		}
+	}
+	if(c->response_len && (events & EPOLLOUT))
+	{
+		while(c->response_pos < c->response_len)
+		{
+			ssize_t n = write(c->base.fd, c->response + c->response_pos, c->response_len - c->response_pos);
+			if(n > 0) { c->response_pos += (size_t)n; continue; }
+			if(n < 0 && errno == EINTR) continue;
+			if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+			return -1;
+		}
+		return -1;
+	}
+	if(events & (EPOLLERR | EPOLLHUP)) return -1;
+	if((events & EPOLLRDHUP) && !c->response_len) return -1;
+	return 0;
+}
+
+static void http_expire(void)
+{
+	struct timespec now;
+	if(clock_gettime(CLOCK_MONOTONIC, &now) == -1) return;
+	for(struct http_client *c = http_clients, *next; c; c = next)
+	{
+		next = c->next;
+		if(now.tv_sec - c->accepted.tv_sec > HTTP_TIMEOUT_SECONDS ||
+		   (now.tv_sec - c->accepted.tv_sec == HTTP_TIMEOUT_SECONDS && now.tv_nsec >= c->accepted.tv_nsec)) http_close(c);
+	}
+}
 
 #if LOG_LEVEL >= LOG_DEBUG
 
@@ -176,6 +336,7 @@ static void free_output_queue(struct st_client *client)
 
 	client->head = NULL;
 	client->tail = NULL;
+	queued_bytes_total -= client->queued_bytes;
 	client->queued_bytes = 0;
 	client->queued_messages = 0;
 }
@@ -251,6 +412,8 @@ static int flush_output(struct st_client *client)
 
 				if(record_activity(client) == -1)
 					return -1;
+				bytes_sent_total += (uint64_t)nw;
+				queued_bytes_total -= (uint64_t)nw;
 				msg->pos += nw;
 				client->queued_bytes -= nw;
 				continue;
@@ -351,6 +514,7 @@ static int accept_client(int epoll_fd, int sfd)
 			if(clients != NULL)
 				clients->prev = client;
 			clients = client;
+			connections_total++;
 			active_clients++; // 現在の接続数を+1
 			
 			// さらに接続待ちが残っているかもしれないので続ける
@@ -412,6 +576,7 @@ int process_input(struct st_client *client)
 
 		client->queued_messages++;
 		client->queued_bytes += msg->len;
+		queued_bytes_total += msg->len;
 	}
 	return 0;
 }
@@ -468,6 +633,7 @@ static int handle_client(int epoll_fd, struct st_client *client, uint32_t events
 			{
 				if(record_activity(client) == -1)
 					return -1;
+				bytes_received_total += (uint64_t)nr;
 				client->in_len += nr;
 				int ret = process_and_flush(client);
 				if(ret != 0)
@@ -693,6 +859,13 @@ int main (void)
 		return -1;
 	}
 
+	int metrics_fd = metrics_listener();
+	if(metrics_fd == -1) return -1;
+	struct fd_info metrics_info = { .type = FD_METRICS_LISTENER, .fd = metrics_fd };
+	struct epoll_event metrics_ev = { .events = EPOLLIN, .data.ptr = &metrics_info };
+	if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, metrics_fd, &metrics_ev) == -1)
+	{ perror("epoll_ctl metrics"); close(metrics_fd); return -1; }
+
 	int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 	if(timer_fd == -1)
 	{
@@ -788,6 +961,13 @@ int main (void)
 					return -1;
 				}
 			}
+			else if(info->type == FD_METRICS_LISTENER)
+				http_accept(epoll_fd, info->fd);
+			else if(info->type == FD_HTTP_CLIENT)
+			{
+				struct http_client *client = events[n].data.ptr;
+				if(http_handle(epoll_fd, client, events[n].events) == -1) http_close(client);
+			}
 			else if(info->type == FD_TIMER)
 			{
 				if(health_check(info->fd) == -1)
@@ -811,6 +991,8 @@ int main (void)
 					LOG(LOG_INFO, "Clean up and Exit.");
 					while(clients != NULL)
 						close_client(clients);
+					while(http_clients != NULL) http_close(http_clients);
+					close(metrics_fd);
 					close(sfd);
 					close(timer_fd);
 					close(signal_fd);
@@ -853,6 +1035,7 @@ int main (void)
 			}
 		}
 		/* Expire only after all pointers returned by epoll_wait have been used. */
+		if(timer_fired) http_expire();
 		if(timer_fired && expire_idle_clients() == -1)
 			return -1;
 	}
